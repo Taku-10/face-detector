@@ -399,8 +399,8 @@ def detect_zipline_segment(
 if __name__ == "__main__":
     # Example usage - modify these values to test with your video
     result = detect_zipline_segment(
-        input_video_path="GH011700.MP4",  # Change this to your video path
-        direction="going",  # or "going"
+        input_video_path="fg.MP4",  # Change this to your video path
+        direction="going",  # or "comingg"
         min_duration=2.0,
         max_duration=20.0,  # Optional: set to None for no limit
     )
