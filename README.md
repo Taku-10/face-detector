@@ -1,4 +1,3 @@
-
 ## Installation
 
 ### Prerequisites
@@ -9,6 +8,7 @@
 ### Install Dependencies
 
 1. Navigate to the project directory:
+
    ```bash
    cd face-detector
    ```
@@ -23,9 +23,9 @@
 ### Running the Program
 
 1. **Edit the video path in `face-detection.py`**:
-   
+
    Open `face-detection.py` and modify the `input_video_path` parameter around line 402:
-   
+
    ```python
    result = detect_zipline_segment(
        input_video_path="your-video-file.MP4",  # Change this to your video path
@@ -58,7 +58,7 @@ The program outputs a JSON object with the following fields:
   "input_video": "your-video-file.MP4",
   "direction": "going",
   "start_time": 2.15,
-  "end_time": 7.50,
+  "end_time": 7.5,
   "duration": 5.35,
   "valid": true
 }
