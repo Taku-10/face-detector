@@ -357,9 +357,9 @@ def detect_zipline_segment(
                 }
 
         else:
-            # For "going": detect when rider first looks at camera (frontal face)
-            # Start time = when stable frontal face is detected
-            # End time = end of video
+            # For "going": detect when rider looks at the camera
+            # Strategy: Find all face detections and pick the one that makes the clip closest to min_duration
+            # If no face detected, use end - min_duration as start
 
             # Get video properties
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -377,16 +377,18 @@ def detect_zipline_segment(
             frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             min_face_width_px = int(frame_width * 0.06)  # 6% of frame width
             min_consecutive_hits = 3  # 3 consecutive detections for stability
-            consecutive_hits = 0
-            segment_start_time = None
 
-            # Track last detection state for smooth video overlay
+            # Collect all face detections throughout the video
+            face_detections = []  # List of (time, confidence, bbox) tuples
             last_faces = []
             last_detection_confidence = 0.0
             last_detected_stable = False
+            consecutive_hits = 0
+            last_stable_detection_time = None
 
             frame_count = 0
 
+            # First pass: collect all face detections
             while True:
                 ret, frame = cap.read()
                 if not ret:
@@ -402,14 +404,13 @@ def detect_zipline_segment(
                     # Detect faces using MediaPipe
                     results = face_detection.process(rgb_frame)
 
-                    # Store detection results and check for stable frontal face
+                    # Store detection results
                     detected_stable_frontal = False
                     last_faces = []
                     last_detection_confidence = 0.0
 
                     if results.detections:
                         # Select the detection with largest bounding box as primary
-                        # This helps when multiple faces are detected (e.g., head shaking, multiple angles)
                         primary_detection = max(
                             results.detections,
                             key=lambda det: (
@@ -436,8 +437,6 @@ def detect_zipline_segment(
                         
                         # Check if face is large enough (filter out very small detections)
                         if w >= min_face_width_px and h >= min_face_width_px:
-                            # MediaPipe face detection is already quite good at detecting frontal faces
-                            # We use confidence threshold to ensure quality detection
                             if confidence >= 0.5:  # MediaPipe confidence threshold
                                 detected_stable_frontal = True
                                 last_faces.append((x, y, w, h))
@@ -445,19 +444,22 @@ def detect_zipline_segment(
 
                     last_detected_stable = detected_stable_frontal
 
+                    # Track stable detections (consecutive hits)
                     if detected_stable_frontal:
                         consecutive_hits += 1
-                        # Lock start time when we have stable detection
-                        if (
-                            consecutive_hits >= min_consecutive_hits
-                            and segment_start_time is None
-                        ):
-                            segment_start_time = frame_time
-                            # Don't break - we need to continue to get video end time
+                        if consecutive_hits >= min_consecutive_hits:
+                            # This is a stable detection - record it
+                            if last_stable_detection_time is None or                                (frame_time - last_stable_detection_time) > 0.5:  # At least 0.5s apart
+                                # Store bbox from last_faces which is already populated
+                                bbox_tuple = last_faces[0] if last_faces else None
+                                face_detections.append({
+                                    "time": frame_time,
+                                    "confidence": last_detection_confidence,
+                                    "bbox": bbox_tuple
+                                })
+                                last_stable_detection_time = frame_time
                     else:
-                        # Reset counter if we haven't locked start yet
-                        if segment_start_time is None:
-                            consecutive_hits = 0
+                        consecutive_hits = 0
 
                 # Create display frame with overlays if needed
                 if show_frames or output_video_path:
@@ -504,23 +506,13 @@ def detect_zipline_segment(
                     )
                     cv2.putText(
                         display_frame,
-                        f"Consecutive: {consecutive_hits}/{min_consecutive_hits}",
+                        f"Detections: {len(face_detections)}",
                         (10, 90),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.7,
                         (255, 255, 255),
                         2,
                     )
-                    if segment_start_time is not None:
-                        cv2.putText(
-                            display_frame,
-                            f"Start Locked: {segment_start_time:.2f}s",
-                            (10, 120),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.7,
-                            (0, 255, 0),
-                            2,
-                        )
 
                 # Show frame with overlay (with longer delay to reduce lag)
                 if show_frames:
@@ -528,6 +520,7 @@ def detect_zipline_segment(
                     # Increased waitKey to reduce lag - waits 30ms instead of 1ms
                     if cv2.waitKey(30) & 0xFF == ord("q"):
                         cap.release()
+                        face_detection.close()
                         if video_writer:
                             video_writer.release()
                         cv2.destroyAllWindows()
@@ -554,20 +547,81 @@ def detect_zipline_segment(
             # End time is the end of the video
             segment_end_time = video_duration
 
-            if segment_start_time is None:
-                return {
-                    "input_video": input_video_path,
-                    "direction": direction,
-                    "valid": False,
-                    "reason": "No stable frontal face detected (rider did not look at camera)",
-                }
+            # Determine start time based on face detections
+            if len(face_detections) == 0:
+                # No face detected: use end - min_duration as start
+                segment_start_time = max(0.0, video_duration - min_duration)
+            else:
+                # Find the detection that makes the clip closest to min_duration
+                best_start_time = None
+                best_duration_diff = float('inf')
+                
+                for detection in face_detections:
+                    candidate_start = detection["time"]
+                    candidate_duration = segment_end_time - candidate_start
+                    
+                    # Check if this duration is within bounds
+                    if candidate_duration < min_duration:
+                        # Too short, skip (or we could extend forward, but that's handled later)
+                        continue
+                    
+                    # Calculate how close this is to min_duration
+                    duration_diff = abs(candidate_duration - min_duration)
+                    
+                    # Prefer durations that are >= min_duration and <= max_duration (if set)
+                    if max_duration is not None and candidate_duration > max_duration:
+                        # This would exceed max, but we can trim it, so still consider it
+                        # But prefer ones that are closer to min_duration
+                        duration_diff = abs(candidate_duration - min_duration)
+                    
+                    if duration_diff < best_duration_diff:
+                        best_duration_diff = duration_diff
+                        best_start_time = candidate_start
+                
+                if best_start_time is not None:
+                    segment_start_time = best_start_time
+                else:
+                    # No detection gave us a valid duration, use the earliest one
+                    segment_start_time = face_detections[0]["time"]
 
-            # Calculate duration
+            # Calculate initial duration
             duration = segment_end_time - segment_start_time
 
+            # Apply duration constraints
+            if max_duration is not None and duration > max_duration:
+                # Trim from the end to reach max_duration
+                segment_end_time = segment_start_time + max_duration
+                duration = max_duration
+            
+            if duration < min_duration:
+                # Try to extend forward if possible
+                # Calculate how much we can extend
+                available_forward = segment_start_time  # How much time before start
+                needed_extension = min_duration - duration
+                
+                if available_forward >= needed_extension:
+                    # Can extend backward
+                    segment_start_time = segment_start_time - needed_extension
+                    duration = min_duration
+                else:
+                    # Can't extend enough, use what we have
+                    # Extend as much as possible
+                    segment_start_time = 0.0
+                    duration = segment_end_time - segment_start_time
+                    
+                    # If still too short, we'll return invalid
+                    if duration < min_duration:
+                        return {
+                            "input_video": input_video_path,
+                            "direction": direction,
+                            "valid": False,
+                            "reason": f"Detected duration {duration:.2f}s is below minimum {min_duration}s (even after extending)",
+                        }
+
+            # Final validation
             if duration >= min_duration:
-                # Apply max_duration cap if specified
                 if max_duration is not None and duration > max_duration:
+                    # Final trim check
                     segment_end_time = segment_start_time + max_duration
                     duration = max_duration
 
@@ -602,10 +656,10 @@ def detect_zipline_segment(
 if __name__ == "__main__":
     # Example usage - modify these values to test with your video
     result = detect_zipline_segment(
-        input_video_path="fg-2.MP4",  # Change this to your video path
+        input_video_path="GH011700.MP4",  # Change this to your video path
         direction="going",  # or "coming"
-        min_duration=2.0,
-        max_duration=20.0,  # Optional: set to None for no limit
+        min_duration=5.0,
+        max_duration=10.0,  # Optional: set to None for no limit
         show_frames=True,  # Set to True to display detection in real-time
         # output_video_path="output_with_detections.mp4",  # Optional: save video with overlays
     )
