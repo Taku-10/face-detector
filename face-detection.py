@@ -14,6 +14,8 @@ def detect_zipline_segment(
     direction: str = "coming",
     min_duration: float = 2.0,
     max_duration: Optional[float] = None,
+    show_frames: bool = False,
+    output_video_path: Optional[str] = None,
 ) -> dict:
     """
     Detects the visible time range of a zipline rider in the video.
@@ -23,6 +25,8 @@ def detect_zipline_segment(
         direction: Either "coming" or "going" (direction of rider)
         min_duration: Minimum motion duration to be considered valid (seconds)
         max_duration: Optional maximum time cap (seconds)
+        show_frames: If True, displays frames with detection overlay in real-time (default: False)
+        output_video_path: Optional path to save video with detection overlay (default: None)
 
     Returns:
         dict with:
@@ -33,6 +37,7 @@ def detect_zipline_segment(
             - duration: total duration (seconds)
             - valid: bool indicating if detection meets criteria
             - reason: optional reason if invalid
+            - output_video: path to saved video (if output_video_path was provided)
     """
     # Validate inputs
     if direction not in ["coming", "going"]:
@@ -71,6 +76,16 @@ def detect_zipline_segment(
         # Frame sampling parameters (sample every ~100ms for efficiency)
         sample_interval = max(1, int(fps * 0.1))  # ~10 samples per second
 
+        # Initialize video writer if output path is provided
+        video_writer = None
+        if output_video_path is not None:
+            frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            video_writer = cv2.VideoWriter(
+                output_video_path, fourcc, fps, (frame_width, frame_height)
+            )
+
         if direction == "coming":
             # For "coming": detect rider approaching (motion that grows over time)
             # Strategy: Process forward, look for motion that starts small and grows
@@ -78,6 +93,11 @@ def detect_zipline_segment(
 
             motion_samples = []
             frame_count = 0
+
+            # Track last detection state for smooth video overlay
+            last_contours = []
+            last_motion_box = None
+            last_motion_area = 0
 
             # First pass: collect all motion data
             while True:
@@ -104,6 +124,8 @@ def detect_zipline_segment(
 
                     has_motion = False
                     motion_area = 0.0
+                    last_contours = contours
+                    last_motion_box = None
 
                     if contours:
                         largest_contour = max(contours, key=cv2.contourArea)
@@ -118,6 +140,8 @@ def detect_zipline_segment(
                             has_motion = True
                             x, y, w, h = cv2.boundingRect(largest_contour)
                             motion_area = float(w * h)
+                            last_motion_box = (x, y, w, h)
+                            last_motion_area = motion_area
 
                     motion_samples.append(
                         {
@@ -127,9 +151,79 @@ def detect_zipline_segment(
                         }
                     )
 
+                # Create display frame with overlays if needed
+                if show_frames or output_video_path:
+                    display_frame = frame.copy()
+
+                    # Draw all contours from last detection
+                    if last_contours:
+                        cv2.drawContours(
+                            display_frame, last_contours, -1, (0, 255, 0), 2
+                        )
+
+                    # Draw bounding box from last significant motion
+                    if last_motion_box:
+                        x, y, w, h = last_motion_box
+                        cv2.rectangle(
+                            display_frame, (x, y), (x + w, y + h), (0, 0, 255), 3
+                        )
+                        cv2.putText(
+                            display_frame,
+                            f"Area: {int(last_motion_area)}",
+                            (x, y - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            (0, 0, 255),
+                            2,
+                        )
+
+                    # Add overlay info
+                    cv2.putText(
+                        display_frame,
+                        f"Time: {frame_time:.2f}s | Frame: {frame_count}",
+                        (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (255, 255, 255),
+                        2,
+                    )
+                    cv2.putText(
+                        display_frame,
+                        f"Direction: {direction}",
+                        (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (255, 255, 255),
+                        2,
+                    )
+
+                # Show frame with overlay (with longer delay to reduce lag)
+                if show_frames:
+                    cv2.imshow("Motion Detection", display_frame)
+                    # Increased waitKey to reduce lag - waits 30ms instead of 1ms
+                    if cv2.waitKey(30) & 0xFF == ord("q"):
+                        cap.release()
+                        if video_writer:
+                            video_writer.release()
+                        cv2.destroyAllWindows()
+                        return {
+                            "input_video": input_video_path,
+                            "direction": direction,
+                            "valid": False,
+                            "reason": "Detection stopped by user",
+                        }
+
+                # Write frame to output video if requested
+                if output_video_path and video_writer:
+                    video_writer.write(display_frame)
+
                 frame_count += 1
 
             cap.release()
+            if video_writer:
+                video_writer.release()
+            if show_frames:
+                cv2.destroyAllWindows()
 
             # Find motion samples with significant area
             motion_with_area = [s for s in motion_samples if s["area"] > 0]
@@ -242,7 +336,7 @@ def detect_zipline_segment(
                     segment_start_time = segment_end_time - max_duration
                     duration = max_duration
 
-                return {
+                result = {
                     "input_video": input_video_path,
                     "direction": direction,
                     "start_time": round(segment_start_time, 2),
@@ -250,6 +344,9 @@ def detect_zipline_segment(
                     "duration": round(duration, 2),
                     "valid": True,
                 }
+                if output_video_path:
+                    result["output_video"] = output_video_path
+                return result
             else:
                 return {
                     "input_video": input_video_path,
@@ -292,6 +389,11 @@ def detect_zipline_segment(
             consecutive_hits = 0
             segment_start_time = None
 
+            # Track last detection state for smooth video overlay
+            last_faces = []
+            last_eyes_per_face = []
+            last_detected_stable = False
+
             frame_count = 0
 
             while True:
@@ -316,9 +418,16 @@ def detect_zipline_segment(
                         flags=cv2.CASCADE_SCALE_IMAGE,
                     )
 
-                    # Check if we have a stable frontal face (with eyes visible)
+                    # Store detection results and check for stable frontal face
                     detected_stable_frontal = False
-                    for x, y, w, h in faces:
+                    last_faces = []
+                    last_eyes_per_face = []
+
+                    if len(faces) > 0:
+                        # Select the largest detected face as the primary subject
+                        primary_face = max(faces, key=lambda rect: rect[2] * rect[3])
+                        x, y, w, h = primary_face
+
                         # Check for eyes to confirm it's a good frontal face
                         face_roi_gray = gray[y : y + h, x : x + w]
                         eyes = eye_cascade.detectMultiScale(
@@ -328,10 +437,18 @@ def detect_zipline_segment(
                             flags=cv2.CASCADE_SCALE_IMAGE,
                             minSize=(int(w * 0.15), int(h * 0.15)),
                         )
+
+                        # Store only the primary face and its eyes for visualization
+                        last_faces.append(primary_face)
+                        last_eyes_per_face.append(
+                            [(x + ex, y + ey, ew, eh) for (ex, ey, ew, eh) in eyes]
+                        )
+
                         # At least one eye visible indicates good frontal face
                         if len(eyes) >= 1:
                             detected_stable_frontal = True
-                            break
+
+                    last_detected_stable = detected_stable_frontal
 
                     if detected_stable_frontal:
                         consecutive_hits += 1
@@ -347,9 +464,107 @@ def detect_zipline_segment(
                         if segment_start_time is None:
                             consecutive_hits = 0
 
+                # Create display frame with overlays if needed
+                if show_frames or output_video_path:
+                    display_frame = frame.copy()
+
+                    # Draw faces from last detection
+                    for i, (x, y, w, h) in enumerate(last_faces):
+                        cv2.rectangle(
+                            display_frame, (x, y), (x + w, y + h), (255, 0, 0), 3
+                        )
+
+                        # Draw eyes for this face
+                        if i < len(last_eyes_per_face):
+                            for ex, ey, ew, eh in last_eyes_per_face[i]:
+                                cv2.rectangle(
+                                    display_frame,
+                                    (ex, ey),
+                                    (ex + ew, ey + eh),
+                                    (0, 255, 0),
+                                    2,
+                                )
+
+                        # Add detection label if stable
+                        if last_detected_stable and i == 0:  # Only label first face
+                            cv2.putText(
+                                display_frame,
+                                "Frontal Face Detected!",
+                                (x, y - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.6,
+                                (0, 255, 0),
+                                2,
+                            )
+
+                    # Add overlay info
+                    status_color = (0, 255, 0) if last_detected_stable else (0, 0, 255)
+                    status_text = "DETECTED" if last_detected_stable else "SEARCHING"
+                    cv2.putText(
+                        display_frame,
+                        f"Time: {frame_time:.2f}s | Frame: {frame_count}",
+                        (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (255, 255, 255),
+                        2,
+                    )
+                    cv2.putText(
+                        display_frame,
+                        f"Direction: {direction} | Status: {status_text}",
+                        (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        status_color,
+                        2,
+                    )
+                    cv2.putText(
+                        display_frame,
+                        f"Consecutive: {consecutive_hits}/{min_consecutive_hits}",
+                        (10, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (255, 255, 255),
+                        2,
+                    )
+                    if segment_start_time is not None:
+                        cv2.putText(
+                            display_frame,
+                            f"Start Locked: {segment_start_time:.2f}s",
+                            (10, 120),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (0, 255, 0),
+                            2,
+                        )
+
+                # Show frame with overlay (with longer delay to reduce lag)
+                if show_frames:
+                    cv2.imshow("Face Detection", display_frame)
+                    # Increased waitKey to reduce lag - waits 30ms instead of 1ms
+                    if cv2.waitKey(30) & 0xFF == ord("q"):
+                        cap.release()
+                        if video_writer:
+                            video_writer.release()
+                        cv2.destroyAllWindows()
+                        return {
+                            "input_video": input_video_path,
+                            "direction": direction,
+                            "valid": False,
+                            "reason": "Detection stopped by user",
+                        }
+
+                # Write frame to output video if requested
+                if output_video_path and video_writer:
+                    video_writer.write(display_frame)
+
                 frame_count += 1
 
             cap.release()
+            if video_writer:
+                video_writer.release()
+            if show_frames:
+                cv2.destroyAllWindows()
 
             # End time is the end of the video
             segment_end_time = video_duration
@@ -371,7 +586,7 @@ def detect_zipline_segment(
                     segment_end_time = segment_start_time + max_duration
                     duration = max_duration
 
-                return {
+                result = {
                     "input_video": input_video_path,
                     "direction": direction,
                     "start_time": round(segment_start_time, 2),
@@ -379,6 +594,9 @@ def detect_zipline_segment(
                     "duration": round(duration, 2),
                     "valid": True,
                 }
+                if output_video_path:
+                    result["output_video"] = output_video_path
+                return result
             else:
                 return {
                     "input_video": input_video_path,
@@ -399,10 +617,12 @@ def detect_zipline_segment(
 if __name__ == "__main__":
     # Example usage - modify these values to test with your video
     result = detect_zipline_segment(
-        input_video_path="fg.MP4",  # Change this to your video path
-        direction="going",  # or "comingg"
+        input_video_path="GH011697.MP4",  # Change this to your video path
+        direction="going",  # or "coming"
         min_duration=2.0,
         max_duration=20.0,  # Optional: set to None for no limit
+        show_frames=True,  # Set to True to display detection in real-time
+        # output_video_path="output_with_detections.mp4",  # Optional: save video with overlays
     )
 
     # Print results
