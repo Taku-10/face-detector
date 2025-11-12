@@ -6,6 +6,7 @@ returning the start and end timestamps for that segment.
 """
 
 import cv2
+import mediapipe as mp
 from typing import Optional
 
 
@@ -364,34 +365,24 @@ def detect_zipline_segment(
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             video_duration = total_frames / fps if fps > 0 else 0.0
 
-            # Load face detection cascades
-            frontal_cascade = cv2.CascadeClassifier(
-                cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            # Initialize MediaPipe Face Detection
+            mp_face_detection = mp.solutions.face_detection
+            face_detection = mp_face_detection.FaceDetection(
+                model_selection=1,  # 0 for short-range, 1 for full-range
+                min_detection_confidence=0.5
             )
-            eye_cascade = cv2.CascadeClassifier(
-                cv2.data.haarcascades + "haarcascade_eye.xml"
-            )
-
-            if frontal_cascade.empty():
-                cap.release()
-                return {
-                    "input_video": input_video_path,
-                    "direction": direction,
-                    "valid": False,
-                    "reason": "Failed to load frontal face cascade",
-                }
 
             # Face detection parameters
-            min_face_width_px = int(
-                cap.get(cv2.CAP_PROP_FRAME_WIDTH) * 0.06
-            )  # 6% of frame width
+            frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            min_face_width_px = int(frame_width * 0.06)  # 6% of frame width
             min_consecutive_hits = 3  # 3 consecutive detections for stability
             consecutive_hits = 0
             segment_start_time = None
 
             # Track last detection state for smooth video overlay
             last_faces = []
-            last_eyes_per_face = []
+            last_detection_confidence = 0.0
             last_detected_stable = False
 
             frame_count = 0
@@ -405,48 +396,52 @@ def detect_zipline_segment(
 
                 # Sample frames for efficiency
                 if frame_count % sample_interval == 0:
-                    # Convert to grayscale for face detection
-                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    cv2.equalizeHist(gray, gray)
-
-                    # Detect frontal faces
-                    faces = frontal_cascade.detectMultiScale(
-                        gray,
-                        scaleFactor=1.1,
-                        minNeighbors=5,
-                        minSize=(min_face_width_px, min_face_width_px),
-                        flags=cv2.CASCADE_SCALE_IMAGE,
-                    )
+                    # Convert BGR to RGB for MediaPipe
+                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    
+                    # Detect faces using MediaPipe
+                    results = face_detection.process(rgb_frame)
 
                     # Store detection results and check for stable frontal face
                     detected_stable_frontal = False
                     last_faces = []
-                    last_eyes_per_face = []
+                    last_detection_confidence = 0.0
 
-                    if len(faces) > 0:
-                        # Select the largest detected face as the primary subject
-                        primary_face = max(faces, key=lambda rect: rect[2] * rect[3])
-                        x, y, w, h = primary_face
-
-                        # Check for eyes to confirm it's a good frontal face
-                        face_roi_gray = gray[y : y + h, x : x + w]
-                        eyes = eye_cascade.detectMultiScale(
-                            face_roi_gray,
-                            scaleFactor=1.1,
-                            minNeighbors=3,
-                            flags=cv2.CASCADE_SCALE_IMAGE,
-                            minSize=(int(w * 0.15), int(h * 0.15)),
+                    if results.detections:
+                        # Select the detection with largest bounding box as primary
+                        # This helps when multiple faces are detected (e.g., head shaking, multiple angles)
+                        primary_detection = max(
+                            results.detections,
+                            key=lambda det: (
+                                det.location_data.relative_bounding_box.width *
+                                det.location_data.relative_bounding_box.height
+                            )
                         )
-
-                        # Store only the primary face and its eyes for visualization
-                        last_faces.append(primary_face)
-                        last_eyes_per_face.append(
-                            [(x + ex, y + ey, ew, eh) for (ex, ey, ew, eh) in eyes]
-                        )
-
-                        # At least one eye visible indicates good frontal face
-                        if len(eyes) >= 1:
-                            detected_stable_frontal = True
+                        
+                        # Get bounding box from MediaPipe detection
+                        bbox = primary_detection.location_data.relative_bounding_box
+                        confidence = primary_detection.score[0]
+                        
+                        # Convert normalized coordinates to pixel coordinates
+                        x = int(bbox.xmin * frame_width)
+                        y = int(bbox.ymin * frame_height)
+                        w = int(bbox.width * frame_width)
+                        h = int(bbox.height * frame_height)
+                        
+                        # Ensure coordinates are within frame bounds
+                        x = max(0, x)
+                        y = max(0, y)
+                        w = min(w, frame_width - x)
+                        h = min(h, frame_height - y)
+                        
+                        # Check if face is large enough (filter out very small detections)
+                        if w >= min_face_width_px and h >= min_face_width_px:
+                            # MediaPipe face detection is already quite good at detecting frontal faces
+                            # We use confidence threshold to ensure quality detection
+                            if confidence >= 0.5:  # MediaPipe confidence threshold
+                                detected_stable_frontal = True
+                                last_faces.append((x, y, w, h))
+                                last_detection_confidence = confidence
 
                     last_detected_stable = detected_stable_frontal
 
@@ -474,22 +469,11 @@ def detect_zipline_segment(
                             display_frame, (x, y), (x + w, y + h), (255, 0, 0), 3
                         )
 
-                        # Draw eyes for this face
-                        if i < len(last_eyes_per_face):
-                            for ex, ey, ew, eh in last_eyes_per_face[i]:
-                                cv2.rectangle(
-                                    display_frame,
-                                    (ex, ey),
-                                    (ex + ew, ey + eh),
-                                    (0, 255, 0),
-                                    2,
-                                )
-
                         # Add detection label if stable
                         if last_detected_stable and i == 0:  # Only label first face
                             cv2.putText(
                                 display_frame,
-                                "Frontal Face Detected!",
+                                f"Face Detected! ({last_detection_confidence:.2f})",
                                 (x, y - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX,
                                 0.6,
@@ -561,6 +545,7 @@ def detect_zipline_segment(
                 frame_count += 1
 
             cap.release()
+            face_detection.close()  # Clean up MediaPipe resources
             if video_writer:
                 video_writer.release()
             if show_frames:
@@ -617,7 +602,7 @@ def detect_zipline_segment(
 if __name__ == "__main__":
     # Example usage - modify these values to test with your video
     result = detect_zipline_segment(
-        input_video_path="GH011697.MP4",  # Change this to your video path
+        input_video_path="fg-2.MP4",  # Change this to your video path
         direction="going",  # or "coming"
         min_duration=2.0,
         max_duration=20.0,  # Optional: set to None for no limit
