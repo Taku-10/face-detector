@@ -7,15 +7,35 @@ returning the start and end timestamps for that segment.
 
 import cv2
 import mediapipe as mp
-from typing import Optional
+from typing import Optional, Dict, Any
+
+
+# Platform-specific configurations
+# Each platform can have its own min_duration, max_duration, ideal_duration, and direction
+PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
+    1: {
+        "direction": "going",
+        "min_duration": 5.0,
+        "max_duration": 10.0,
+        "ideal_duration": 8.0,
+    },
+    2: {
+        "direction": "coming",
+        "min_duration": 5.0,
+        "max_duration": 10.0,
+        "ideal_duration": 8.0,
+    },
+
+}
 
 
 def detect_zipline_segment(
     input_video_path: str,
-    direction: str = "coming",
-    min_duration: float = 4.0,
-    max_duration: float = 10.0,
-    ideal_duration: float = 8.0,
+    direction: Optional[str] = None,
+    min_duration: Optional[float] = None,
+    max_duration: Optional[float] = None,
+    ideal_duration: Optional[float] = None,
+    platform_number: Optional[int] = None,
     show_frames: bool = False,
     output_video_path: Optional[str] = None,
 ) -> dict:
@@ -25,10 +45,22 @@ def detect_zipline_segment(
     Args:
         input_video_path: Path to the raw video file
         direction: Either "coming" or "going" (direction of rider)
+            - If None and platform_number is provided, uses platform's direction
+            - If None and platform_number is not provided, defaults to "coming"
         min_duration: Minimum motion duration to be considered valid (seconds)
+            - If None and platform_number is provided, uses platform's min_duration
+            - If None and platform_number is not provided, uses default from platform 1
         max_duration: Optional maximum time cap (seconds)
-        ideal_duration: Ideal duration for the clip (default: 8.0 seconds)
+            - If None and platform_number is provided, uses platform's max_duration
+            - If None and platform_number is not provided, uses default from platform 1
+        ideal_duration: Ideal duration for the clip (seconds)
+            - If None and platform_number is provided, uses platform's ideal_duration
+            - If None and platform_number is not provided, uses default from platform 1
             - For "going" videos: system picks face detection that gets closest to this duration
+        platform_number: Platform number (1, 2, 3, etc.) to use platform-specific settings
+            - If provided, overrides direction, min_duration, max_duration, ideal_duration with platform config
+            - Platform configs are defined in PLATFORM_CONFIGS dictionary
+            - Individual parameters can still override platform settings if explicitly provided
         show_frames: If True, displays frames with detection overlay in real-time (default: False)
         output_video_path: Optional path to save video with detection overlay (default: None)
 
@@ -42,6 +74,14 @@ def detect_zipline_segment(
             - valid: bool indicating if detection meets criteria
             - reason: optional reason if invalid
             - output_video: path to saved video (if output_video_path was provided)
+            - platform_number: platform number used (if provided)
+
+    Platform Configuration:
+        Each platform can have its own settings defined in PLATFORM_CONFIGS:
+        - direction: "coming" or "going"
+        - min_duration: minimum clip duration
+        - max_duration: maximum clip duration
+        - ideal_duration: ideal clip duration (for "going" videos)
 
     Detection Logic:
 
@@ -64,6 +104,39 @@ def detect_zipline_segment(
       * If duration < min_duration: Extend forward (backward in time) if possible, otherwise use full segment
       * Final clip must always respect min_duration and max_duration constraints
     """
+    # Apply platform-specific configuration if platform_number is provided
+    if platform_number is not None:
+        if platform_number not in PLATFORM_CONFIGS:
+            return {
+                "input_video": input_video_path,
+                "direction": direction or "unknown",
+                "valid": False,
+                "reason": f"Platform {platform_number} not found in PLATFORM_CONFIGS. Available platforms: {list(PLATFORM_CONFIGS.keys())}",
+                "platform_number": platform_number,
+            }
+
+        platform_config = PLATFORM_CONFIGS[platform_number]
+
+        # Use platform config values if individual parameters are not provided
+        if direction is None:
+            direction = platform_config.get("direction", "coming")
+        if min_duration is None:
+            min_duration = platform_config.get("min_duration", 4.0)
+        if max_duration is None:
+            max_duration = platform_config.get("max_duration", 10.0)
+        if ideal_duration is None:
+            ideal_duration = platform_config.get("ideal_duration", 8.0)
+    else:
+        # Use defaults if no platform and no explicit values
+        if direction is None:
+            direction = "coming"
+        if min_duration is None:
+            min_duration = 4.0
+        if max_duration is None:
+            max_duration = 10.0
+        if ideal_duration is None:
+            ideal_duration = 8.0
+
     # Validate inputs
     if direction not in ["coming", "going"]:
         return {
@@ -71,27 +144,34 @@ def detect_zipline_segment(
             "direction": direction,
             "valid": False,
             "reason": f"Invalid direction: {direction}. Must be 'coming' or 'going'",
+            "platform_number": platform_number,
         }
 
     try:
         # Open video
         cap = cv2.VideoCapture(input_video_path)
         if not cap.isOpened():
-            return {
+            result = {
                 "input_video": input_video_path,
                 "direction": direction,
                 "valid": False,
                 "reason": "Could not open video file",
             }
+            if platform_number is not None:
+                result["platform_number"] = platform_number
+            return result
 
         fps = cap.get(cv2.CAP_PROP_FPS)
         if fps <= 0:
-            return {
+            result = {
                 "input_video": input_video_path,
                 "direction": direction,
                 "valid": False,
                 "reason": "Invalid FPS in video file",
             }
+            if platform_number is not None:
+                result["platform_number"] = platform_number
+            return result
 
         # Initialize background subtractor for motion detection
         bg_subtractor = cv2.createBackgroundSubtractorMOG2(
@@ -320,12 +400,15 @@ def detect_zipline_segment(
                         if video_writer:
                             video_writer.release()
                         cv2.destroyAllWindows()
-                        return {
+                        result = {
                             "input_video": input_video_path,
                             "direction": direction,
                             "valid": False,
                             "reason": "Detection stopped by user",
                         }
+                        if platform_number is not None:
+                            result["platform_number"] = platform_number
+                        return result
 
                 # Write frame to output video if requested
                 if output_video_path and video_writer:
@@ -480,12 +563,15 @@ def detect_zipline_segment(
 
                     # If still too short, we'll return invalid
                     if duration < min_duration:
-                        return {
+                        result = {
                             "input_video": input_video_path,
                             "direction": direction,
                             "valid": False,
                             "reason": f"Detected duration {duration:.2f}s is below minimum {min_duration}s (even after extending)",
                         }
+                        if platform_number is not None:
+                            result["platform_number"] = platform_number
+                        return result
 
             # Final validation
             if duration >= min_duration:
@@ -504,14 +590,19 @@ def detect_zipline_segment(
                 }
                 if output_video_path:
                     result["output_video"] = output_video_path
+                if platform_number is not None:
+                    result["platform_number"] = platform_number
                 return result
             else:
-                return {
+                result = {
                     "input_video": input_video_path,
                     "direction": direction,
                     "valid": False,
                     "reason": f"Detected duration {duration:.2f}s is below minimum {min_duration}s",
                 }
+                if platform_number is not None:
+                    result["platform_number"] = platform_number
+                return result
 
         else:
             # For "going": detect when rider looks at the camera
@@ -686,12 +777,15 @@ def detect_zipline_segment(
                         if video_writer:
                             video_writer.release()
                         cv2.destroyAllWindows()
-                        return {
+                        result = {
                             "input_video": input_video_path,
                             "direction": direction,
                             "valid": False,
                             "reason": "Detection stopped by user",
                         }
+                        if platform_number is not None:
+                            result["platform_number"] = platform_number
+                        return result
 
                 # Write frame to output video if requested
                 if output_video_path and video_writer:
@@ -800,35 +894,60 @@ def detect_zipline_segment(
                 }
                 if output_video_path:
                     result["output_video"] = output_video_path
+                if platform_number is not None:
+                    result["platform_number"] = platform_number
                 return result
             else:
-                return {
+                result = {
                     "input_video": input_video_path,
                     "direction": direction,
                     "valid": False,
                     "reason": f"Detected duration {duration:.2f}s is below minimum {min_duration}s",
                 }
+                if platform_number is not None:
+                    result["platform_number"] = platform_number
+                return result
 
     except Exception as e:
-        return {
+        result = {
             "input_video": input_video_path,
             "direction": direction,
             "valid": False,
             "reason": f"Error processing video: {str(e)}",
         }
+        if platform_number is not None:
+            result["platform_number"] = platform_number
+        return result
 
 
 if __name__ == "__main__":
     # Example usage - modify these values to test with your video
+
+    # Option 1: Use platform-specific configuration
     result = detect_zipline_segment(
-        input_video_path="coming-new-3.MP4",  # Change this to your video path
-        direction="going",  # or "coming"
-        min_duration=2.0,
-        max_duration=20.0,
-        ideal_duration=8.0,  # Ideal duration for "going" videos (default: 8.0 seconds)
+        input_video_path="coming-3.MP4",  # Change this to your video path
+        platform_number=2,  # Uses platform 2 settings (direction="going", min_duration=2.0, max_duration=20.0, ideal_duration=8.0)
         show_frames=True,  # Set to True to display detection in real-time
         # output_video_path="output_with_detections.mp4",  # Optional: save video with overlays
     )
+
+    # Option 2: Override platform settings with explicit parameters
+    # result = detect_zipline_segment(
+    #     input_video_path="coming-new-3.MP4",
+    #     platform_number=2,  # Base settings from platform 2
+    #     ideal_duration=10.0,  # Override ideal_duration to 10.0
+    #     show_frames=True,
+    # )
+
+    # Option 3: Use explicit parameters without platform
+    # result = detect_zipline_segment(
+    #     input_video_path="coming-new-3.MP4",
+    #     direction="going",
+    #     min_duration=2.0,
+    #     max_duration=20.0,
+    #     ideal_duration=8.0,
+    #     show_frames=True,
+    # )
 
     # Print results
     import json
