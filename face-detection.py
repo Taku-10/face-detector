@@ -88,19 +88,42 @@ def detect_zipline_segment(
             )
 
         if direction == "coming":
-            # For "coming": detect rider approaching (motion that grows over time)
-            # Strategy: Process forward, look for motion that starts small and grows
-            # This filters out guide's constant small motion
+            # For "coming": rider comes from higher platform down to lower platform (camera position)
+            # Strategy: 
+            # - Start = first person detection (rider entering frame)
+            # - End = last face detection (rider looking at camera)
+            # - If face detection period < 2s, extend end by 2s for smoother finish
+            # - Apply duration constraints
 
-            motion_samples = []
-            frame_count = 0
+            # Get video properties
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            video_duration = total_frames / fps if fps > 0 else 0.0
 
-            # Track last detection state for smooth video overlay
-            last_contours = []
+            # Initialize MediaPipe Face Detection
+            mp_face_detection = mp.solutions.face_detection
+            face_detection = mp_face_detection.FaceDetection(
+                model_selection=1,  # 0 for short-range, 1 for full-range
+                min_detection_confidence=0.5
+            )
+
+            # Face detection parameters
+            frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            min_face_width_px = int(frame_width * 0.06)  # 6% of frame width
+
+            # Track detections
+            motion_samples = []  # Collect all motion samples to filter out guide
+            face_detections = []  # List of face detection times
+            last_faces = []
+            last_detection_confidence = 0.0
+            last_detected_face = False
             last_motion_box = None
             last_motion_area = 0
+            last_contours = []
 
-            # First pass: collect all motion data
+            frame_count = 0
+
+            # First pass: collect all motion and face detection data
             while True:
                 ret, frame = cap.read()
                 if not ret:
@@ -108,9 +131,9 @@ def detect_zipline_segment(
 
                 frame_time = frame_count / fps
 
-                # Sample frames
+                # Sample frames for efficiency
                 if frame_count % sample_interval == 0:
-                    # Apply background subtraction
+                    # Detect person/motion using background subtraction
                     fg_mask = bg_subtractor.apply(frame)
 
                     # Morphological operations to reduce noise
@@ -118,7 +141,7 @@ def detect_zipline_segment(
                     fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
                     fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
 
-                    # Find contours
+                    # Find contours for person detection
                     contours, _ = cv2.findContours(
                         fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
                     )
@@ -133,9 +156,7 @@ def detect_zipline_segment(
                         area = cv2.contourArea(largest_contour)
 
                         # Threshold for significant movement
-                        min_area = (
-                            frame.shape[0] * frame.shape[1]
-                        ) * 0.01  # 1% of frame
+                        min_area = (frame.shape[0] * frame.shape[1]) * 0.01  # 1% of frame
 
                         if area > min_area:
                             has_motion = True
@@ -144,39 +165,93 @@ def detect_zipline_segment(
                             last_motion_box = (x, y, w, h)
                             last_motion_area = motion_area
 
-                    motion_samples.append(
-                        {
-                            "time": frame_time,
-                            "has_motion": has_motion,
-                            "area": motion_area,
-                        }
-                    )
+                    # Store motion sample for later analysis
+                    motion_samples.append({
+                        "time": frame_time,
+                        "has_motion": has_motion,
+                        "area": motion_area,
+                    })
+
+                    # Detect faces using MediaPipe
+                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    results = face_detection.process(rgb_frame)
+
+                    detected_face = False
+                    last_faces = []
+                    last_detection_confidence = 0.0
+
+                    if results.detections:
+                        # Select the detection with largest bounding box
+                        primary_detection = max(
+                            results.detections,
+                            key=lambda det: (
+                                det.location_data.relative_bounding_box.width *
+                                det.location_data.relative_bounding_box.height
+                            )
+                        )
+                        
+                        bbox = primary_detection.location_data.relative_bounding_box
+                        confidence = primary_detection.score[0]
+                        
+                        # Convert normalized coordinates to pixel coordinates
+                        x = int(bbox.xmin * frame_width)
+                        y = int(bbox.ymin * frame_height)
+                        w = int(bbox.width * frame_width)
+                        h = int(bbox.height * frame_height)
+                        
+                        # Ensure coordinates are within frame bounds
+                        x = max(0, x)
+                        y = max(0, y)
+                        w = min(w, frame_width - x)
+                        h = min(h, frame_height - y)
+                        
+                        # Check if face is large enough
+                        if w >= min_face_width_px and h >= min_face_width_px:
+                            if confidence >= 0.5:
+                                detected_face = True
+                                last_faces.append((x, y, w, h))
+                                last_detection_confidence = confidence
+                                
+                                # Record face detection time
+                                face_detections.append(frame_time)
+
+                    last_detected_face = detected_face
 
                 # Create display frame with overlays if needed
                 if show_frames or output_video_path:
                     display_frame = frame.copy()
 
-                    # Draw all contours from last detection
-                    if last_contours:
-                        cv2.drawContours(
-                            display_frame, last_contours, -1, (0, 255, 0), 2
-                        )
-
-                    # Draw bounding box from last significant motion
+                    # Draw motion/person detection
                     if last_motion_box:
                         x, y, w, h = last_motion_box
                         cv2.rectangle(
-                            display_frame, (x, y), (x + w, y + h), (0, 0, 255), 3
+                            display_frame, (x, y), (x + w, y + h), (0, 255, 0), 2
                         )
                         cv2.putText(
                             display_frame,
-                            f"Area: {int(last_motion_area)}",
+                            "Person",
                             (x, y - 10),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.6,
-                            (0, 0, 255),
+                            (0, 255, 0),
                             2,
                         )
+
+                    # Draw face detection
+                    for i, (x, y, w, h) in enumerate(last_faces):
+                        cv2.rectangle(
+                            display_frame, (x, y), (x + w, y + h), (255, 0, 0), 3
+                        )
+                        if i == 0:
+                            cv2.putText(
+                                display_frame,
+                                f"Face ({last_detection_confidence:.2f})",
+                                (x, y - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.6,
+                                (255, 0, 0),
+                                2,
+                            )
 
                     # Add overlay info
                     cv2.putText(
@@ -197,13 +272,23 @@ def detect_zipline_segment(
                         (255, 255, 255),
                         2,
                     )
+                    # Note: Start time will be determined after processing all frames
+                    cv2.putText(
+                        display_frame,
+                        f"Faces: {len(face_detections)}",
+                        (10, 120),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (255, 255, 255),
+                        2,
+                    )
 
-                # Show frame with overlay (with longer delay to reduce lag)
+                # Show frame with overlay
                 if show_frames:
-                    cv2.imshow("Motion Detection", display_frame)
-                    # Increased waitKey to reduce lag - waits 30ms instead of 1ms
+                    cv2.imshow("Coming Detection", display_frame)
                     if cv2.waitKey(30) & 0xFF == ord("q"):
                         cap.release()
+                        face_detection.close()
                         if video_writer:
                             video_writer.release()
                         cv2.destroyAllWindows()
@@ -221,120 +306,150 @@ def detect_zipline_segment(
                 frame_count += 1
 
             cap.release()
+            face_detection.close()  # Clean up MediaPipe resources
             if video_writer:
                 video_writer.release()
             if show_frames:
                 cv2.destroyAllWindows()
 
-            # Find motion samples with significant area
+            # Determine start and end times
+            # Filter out guide's motion - look for motion that grows over time (rider approaching)
             motion_with_area = [s for s in motion_samples if s["area"] > 0]
+            
             if not motion_with_area:
-                return {
-                    "input_video": input_video_path,
-                    "direction": direction,
-                    "valid": False,
-                    "reason": "No motion detected in video",
-                }
-
-            # Find max area to determine thresholds
-            max_area = max(s["area"] for s in motion_with_area)
-
-            # For "coming", rider motion should GROW over time (small to large)
-            # Guide motion stays small and constant
-            # Strategy: Look for motion that shows growth pattern
-
-            segment_start_time = None
-            segment_end_time = None
-
-            # Look for motion that grows significantly (rider approaching)
-            # Track area progression forward in time
-            growth_window_size = 5  # Check growth over 5 samples (~0.5 seconds)
-            min_growth_factor = 2.0  # Area must grow by at least 2x to be rider
-
-            for i in range(len(motion_samples) - growth_window_size):
-                sample = motion_samples[i]
-
-                # Check if this sample has motion
-                if sample["area"] == 0:
-                    continue
-
-                # Look ahead to see if motion grows (rider approaching)
-                future_samples = motion_samples[i : i + growth_window_size]
-                future_areas = [s["area"] for s in future_samples if s["area"] > 0]
-
-                if len(future_areas) >= 2:
-                    initial_area = sample["area"]
-                    max_future_area = max(future_areas)
-
-                    # Check if motion grows significantly (rider approaching)
-                    if max_future_area >= initial_area * min_growth_factor:
-                        # This is likely the rider! Start segment here
-                        segment_start_time = sample["time"]
-                        break
-
-            # If we didn't find growing motion, use first significant motion
-            # but filter out very small constant motion (guide)
-            if segment_start_time is None:
-                # Use a higher threshold to filter out guide's small motion
-                guide_filter_threshold = max_area * 0.15  # Must be at least 15% of max
-
-                for sample in motion_samples:
-                    if sample["area"] >= guide_filter_threshold:
-                        segment_start_time = sample["time"]
-                        break
-
-            if segment_start_time is None:
-                return {
-                    "input_video": input_video_path,
-                    "direction": direction,
-                    "valid": False,
-                    "reason": "Could not detect rider motion (filtered out guide motion)",
-                }
-
-            # Find end time: when motion stops or becomes very small
-            # Work forward from start to find when motion ends
-            start_idx = next(
-                (
-                    i
-                    for i, s in enumerate(motion_samples)
-                    if s["time"] >= segment_start_time
-                ),
-                len(motion_samples) - 1,
-            )
-
-            # Look for when motion stops or becomes very small
-            # Allow for brief gaps (rider might be briefly occluded)
-            min_end_area = max_area * 0.05  # 5% of max - very small
-            gap_tolerance = 3  # Allow up to 3 samples (~0.3s) of no motion
-
-            last_motion_idx = start_idx
-            gap_count = 0
-
-            for i in range(start_idx, len(motion_samples)):
-                sample = motion_samples[i]
-
-                if sample["area"] >= min_end_area:
-                    # Motion detected
-                    last_motion_idx = i
-                    gap_count = 0
+                # No motion detected - fallback: use last min_duration seconds
+                segment_start_time = max(0.0, video_duration - min_duration)
+                segment_end_time = video_duration
+            else:
+                # Find max area to determine thresholds
+                max_area = max(s["area"] for s in motion_with_area)
+                
+                # Look for motion that grows significantly (rider approaching, not guide)
+                # Guide motion stays small and constant, rider motion grows
+                growth_window_size = 5  # Check growth over 5 samples (~0.5 seconds)
+                min_growth_factor = 2.0  # Area must grow by at least 2x to be rider
+                
+                segment_start_time = None
+                
+                for i in range(len(motion_samples) - growth_window_size):
+                    sample = motion_samples[i]
+                    
+                    # Check if this sample has motion
+                    if sample["area"] == 0:
+                        continue
+                    
+                    # Look ahead to see if motion grows (rider approaching)
+                    future_samples = motion_samples[i : i + growth_window_size]
+                    future_areas = [s["area"] for s in future_samples if s["area"] > 0]
+                    
+                    if len(future_areas) >= 2:
+                        initial_area = sample["area"]
+                        max_future_area = max(future_areas)
+                        
+                        # Check if motion grows significantly (rider approaching)
+                        if max_future_area >= initial_area * min_growth_factor:
+                            # This is likely the rider! Start segment here
+                            segment_start_time = sample["time"]
+                            break
+                
+                # If we didn't find growing motion, use first significant motion
+                # but filter out very small constant motion (guide)
+                if segment_start_time is None:
+                    # Use a higher threshold to filter out guide's small motion
+                    guide_filter_threshold = max_area * 0.15  # Must be at least 15% of max
+                    
+                    for sample in motion_samples:
+                        if sample["area"] >= guide_filter_threshold:
+                            segment_start_time = sample["time"]
+                            break
+                
+                segment_end_time = None  # Will be determined below
+                
+                if segment_start_time is None:
+                    # No rider motion detected - fallback: use last min_duration seconds
+                    segment_start_time = max(0.0, video_duration - min_duration)
+                    segment_end_time = video_duration
                 else:
-                    gap_count += 1
-                    if gap_count >= gap_tolerance:
-                        # Motion has stopped
-                        segment_end_time = motion_samples[last_motion_idx]["time"]
-                        break
+                    # Start = first rider detection (filtered from guide)
+                    # End = when rider motion stops (more reliable than face detection)
+                    # Find when motion stops after the start time
+                    start_idx = next(
+                        (i for i, s in enumerate(motion_samples) if s["time"] >= segment_start_time),
+                        len(motion_samples) - 1,
+                    )
+                    
+                    # Look for when motion stops or becomes very small
+                    # Allow for brief gaps (rider might be briefly occluded)
+                    max_area = max(s["area"] for s in motion_with_area)
+                    min_end_area = max_area * 0.05  # 5% of max - very small
+                    gap_tolerance = 3  # Allow up to 3 samples (~0.3s) of no motion
+                    
+                    last_motion_idx = start_idx
+                    gap_count = 0
+                    
+                    for i in range(start_idx, len(motion_samples)):
+                        sample = motion_samples[i]
+                        
+                        if sample["area"] >= min_end_area:
+                            # Motion detected
+                            last_motion_idx = i
+                            gap_count = 0
+                        else:
+                            gap_count += 1
+                            if gap_count >= gap_tolerance:
+                                # Motion has stopped
+                                segment_end_time = motion_samples[last_motion_idx]["time"]
+                                break
+                    
+                    # If motion continues to end of video
+                    if segment_end_time is None:
+                        segment_end_time = motion_samples[last_motion_idx]["time"] if last_motion_idx < len(motion_samples) else video_duration
+                    
+                    # Ensure segment_end_time is set
+                    if segment_end_time is None:
+                        segment_end_time = video_duration
+                    
+                    # Extend by 1-2 seconds after motion stops for smoother finish
+                    extension_time = 1.5  # 1.5 seconds extension
+                    segment_end_time = min(video_duration, segment_end_time + extension_time)
 
-            # If motion continues to end of video
-            if segment_end_time is None:
-                segment_end_time = motion_samples[last_motion_idx]["time"]
-
-            # Calculate duration
+            # Calculate initial duration
             duration = segment_end_time - segment_start_time
 
+            # Apply duration constraints
+            if max_duration is not None and duration > max_duration:
+                # Trim from the end to reach max_duration
+                segment_end_time = segment_start_time + max_duration
+                duration = max_duration
+            
+            if duration < min_duration:
+                # Try to extend forward (later in video) if possible
+                available_forward = video_duration - segment_end_time
+                needed_extension = min_duration - duration
+                
+                if available_forward >= needed_extension:
+                    # Can extend forward
+                    segment_end_time = segment_end_time + needed_extension
+                    duration = min_duration
+                else:
+                    # Can't extend enough, extend as much as possible
+                    segment_end_time = video_duration
+                    duration = segment_end_time - segment_start_time
+                    
+                    # If still too short, we'll return invalid
+                    if duration < min_duration:
+                        return {
+                            "input_video": input_video_path,
+                            "direction": direction,
+                            "valid": False,
+                            "reason": f"Detected duration {duration:.2f}s is below minimum {min_duration}s (even after extending)",
+                        }
+
+            # Final validation
             if duration >= min_duration:
-                # Apply max_duration cap if specified
                 if max_duration is not None and duration > max_duration:
-                    segment_start_time = segment_end_time - max_duration
+                    # Final trim check
+                    segment_end_time = segment_start_time + max_duration
                     duration = max_duration
 
                 result = {
@@ -355,6 +470,7 @@ def detect_zipline_segment(
                     "valid": False,
                     "reason": f"Detected duration {duration:.2f}s is below minimum {min_duration}s",
                 }
+
 
         else:
             # For "going": detect when rider looks at the camera
@@ -656,10 +772,10 @@ def detect_zipline_segment(
 if __name__ == "__main__":
     # Example usage - modify these values to test with your video
     result = detect_zipline_segment(
-        input_video_path="GH011700.MP4",  # Change this to your video path
+        input_video_path="fg.MP4",  # Change this to your video path
         direction="going",  # or "coming"
         min_duration=5.0,
-        max_duration=10.0,  # Optional: set to None for no limit
+        max_duration=10.0,  
         show_frames=True,  # Set to True to display detection in real-time
         # output_video_path="output_with_detections.mp4",  # Optional: save video with overlays
     )
