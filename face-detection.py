@@ -97,12 +97,14 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "min_duration": 5.0,
         "max_duration": 10.0,
         "ideal_duration": 8.0,
+        "end_trim_seconds": 0.0,  # Seconds to remove from end for "coming" videos when reaching video end
     },
     2: {
         "direction": "coming",
         "min_duration": 5.0,
         "max_duration": 10.0,
         "ideal_duration": 8.0,
+        "end_trim_seconds": 1.0,  # Seconds to remove from end for "coming" videos when reaching video end
     },
 }
 
@@ -113,6 +115,7 @@ def detect_zipline_segment(
     min_duration: Optional[float] = None,
     max_duration: Optional[float] = None,
     ideal_duration: Optional[float] = None,
+    end_trim_seconds: Optional[float] = None,
     platform_number: Optional[int] = None,
     show_frames: bool = False,
     output_video_path: Optional[str] = None,
@@ -136,6 +139,10 @@ def detect_zipline_segment(
             - If None and platform_number is provided, uses platform's ideal_duration
             - If None and platform_number is not provided, uses default from platform 1
             - For "going" videos: system picks face detection that gets closest to this duration
+        end_trim_seconds: Seconds to remove from end for "coming" videos when end reaches video end
+            - If None and platform_number is provided, uses platform's end_trim_seconds
+            - If None and platform_number is not provided, defaults to 1.0
+            - Only applies to "coming" videos when (start_time + ideal_duration) >= video_duration
         platform_number: Platform number (1, 2, 3, etc.) to use platform-specific settings
             - If provided, overrides direction, min_duration, max_duration, ideal_duration with platform config
             - Platform configs are defined in PLATFORM_CONFIGS dictionary
@@ -164,7 +171,8 @@ def detect_zipline_segment(
         - direction: "coming" or "going"
         - min_duration: minimum clip duration
         - max_duration: maximum clip duration
-        - ideal_duration: ideal clip duration (for "going" videos)
+        - ideal_duration: ideal clip duration
+        - end_trim_seconds: seconds to remove from end for "coming" videos when reaching video end
 
     Detection Logic:
 
@@ -172,8 +180,8 @@ def detect_zipline_segment(
     - Detects when rider approaches from higher platform to camera position
     - Start: First significant motion detection (rider entering frame, filtered from guide motion)
     - End: start_time + ideal_duration
-      * If (start_time + ideal_duration) >= video_duration: end_time = video_duration - 1.0
-        (removes 1s to crop out guide's hand switching off camera)
+      * If (start_time + ideal_duration) >= video_duration: end_time = video_duration - end_trim_seconds
+        (removes end_trim_seconds to crop out guide's hand switching off camera)
       * If (start_time + ideal_duration) < video_duration: end_time = start_time + ideal_duration
     - Motion detection uses background subtraction to find growing motion patterns
     - Filters out guide's constant small motion, focuses on rider's growing motion
@@ -215,6 +223,8 @@ def detect_zipline_segment(
             max_duration = platform_config.get("max_duration", 10.0)
         if ideal_duration is None:
             ideal_duration = platform_config.get("ideal_duration", 8.0)
+        if end_trim_seconds is None:
+            end_trim_seconds = platform_config.get("end_trim_seconds", 1.0)
     else:
         # Use defaults if no platform and no explicit values
         if direction is None:
@@ -225,6 +235,8 @@ def detect_zipline_segment(
             max_duration = 10.0
         if ideal_duration is None:
             ideal_duration = 8.0
+        if end_trim_seconds is None:
+            end_trim_seconds = 1.0
 
     # Validate inputs
     if direction not in ["coming", "going"]:
@@ -567,23 +579,25 @@ def detect_zipline_segment(
 
                 # Determine end time based on ideal_duration
                 if segment_start_time is None:
-                    # No rider motion detected - fallback: use segment from (video_duration - ideal_duration) to (video_duration - 1.0)
+                    # No rider motion detected - fallback: use segment from (video_duration - ideal_duration) to (video_duration - end_trim_seconds)
                     segment_start_time = max(0.0, video_duration - ideal_duration)
-                    # If end would be at video end, remove 1s to crop guide's hand
+                    # If end would be at video end, remove end_trim_seconds to crop guide's hand
                     if segment_start_time + ideal_duration >= video_duration:
-                        segment_end_time = video_duration - 1.0
+                        segment_end_time = max(
+                            segment_start_time + 0.1, video_duration - end_trim_seconds
+                        )  # Ensure end > start
                     else:
                         segment_end_time = segment_start_time + ideal_duration
                 else:
                     # New logic for "coming" videos:
                     # End time = start_time + ideal_duration
-                    # BUT if that reaches video end, remove 1s to crop guide's hand switching off camera
+                    # BUT if that reaches video end, remove end_trim_seconds to crop guide's hand switching off camera
                     calculated_end_time = segment_start_time + ideal_duration
 
                     if calculated_end_time >= video_duration:
-                        # End time would be at or past video end, so remove 1s to crop guide's hand
+                        # End time would be at or past video end, so remove end_trim_seconds to crop guide's hand
                         segment_end_time = max(
-                            segment_start_time + 0.1, video_duration - 1.0
+                            segment_start_time + 0.1, video_duration - end_trim_seconds
                         )  # Ensure end > start
                     else:
                         # End time is before video end, use calculated end time
@@ -1012,7 +1026,7 @@ if __name__ == "__main__":
 
     # Option 1: Use platform-specific configuration with video trimming
     result = detect_zipline_segment(
-        input_video_path="coming-new-1.MP4",  # Change this to your video path
+        input_video_path="coming-new-2.MP4",  # Change this to your video path
         platform_number=2,  # Uses platform 2 settings
         show_frames=True,  # Set to True to display detection in real-time
         # output_video_path="output_with_detections.mp4",  # Optional: save video with overlays
