@@ -98,6 +98,7 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "max_duration": 10.0,
         "ideal_duration": 8.0,
         "end_trim_seconds": 0.0,  # Seconds to remove from end for "coming" videos when reaching video end
+        "backward_extension_seconds": 2.0,  # Seconds to extend backward (earlier) when duration is too short
     },
     2: {
         "direction": "coming",
@@ -105,6 +106,7 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "max_duration": 10.0,
         "ideal_duration": 8.0,
         "end_trim_seconds": 1.0,  # Seconds to remove from end for "coming" videos when reaching video end
+        "backward_extension_seconds": 2.0,  # Seconds to extend backward (earlier) when duration is too short
     },
 }
 
@@ -116,6 +118,7 @@ def detect_zipline_segment(
     max_duration: Optional[float] = None,
     ideal_duration: Optional[float] = None,
     end_trim_seconds: Optional[float] = None,
+    backward_extension_seconds: Optional[float] = None,
     platform_number: Optional[int] = None,
     show_frames: bool = False,
     output_video_path: Optional[str] = None,
@@ -143,6 +146,11 @@ def detect_zipline_segment(
             - If None and platform_number is provided, uses platform's end_trim_seconds
             - If None and platform_number is not provided, defaults to 1.0
             - Only applies to "coming" videos when (start_time + ideal_duration) >= video_duration
+        backward_extension_seconds: Seconds to extend backward (earlier) when duration is too short
+            - If None and platform_number is provided, uses platform's backward_extension_seconds
+            - If None and platform_number is not provided, defaults to 2.0
+            - For "coming" videos: used first when duration < min_duration
+            - For "going" videos: used as fallback when forward extension fails
         platform_number: Platform number (1, 2, 3, etc.) to use platform-specific settings
             - If provided, overrides direction, min_duration, max_duration, ideal_duration with platform config
             - Platform configs are defined in PLATFORM_CONFIGS dictionary
@@ -173,6 +181,7 @@ def detect_zipline_segment(
         - max_duration: maximum clip duration
         - ideal_duration: ideal clip duration
         - end_trim_seconds: seconds to remove from end for "coming" videos when reaching video end
+        - backward_extension_seconds: seconds to extend backward (earlier) when duration is too short
 
     Detection Logic:
 
@@ -225,6 +234,10 @@ def detect_zipline_segment(
             ideal_duration = platform_config.get("ideal_duration", 8.0)
         if end_trim_seconds is None:
             end_trim_seconds = platform_config.get("end_trim_seconds", 1.0)
+        if backward_extension_seconds is None:
+            backward_extension_seconds = platform_config.get(
+                "backward_extension_seconds", 2.0
+            )
     else:
         # Use defaults if no platform and no explicit values
         if direction is None:
@@ -237,6 +250,8 @@ def detect_zipline_segment(
             ideal_duration = 8.0
         if end_trim_seconds is None:
             end_trim_seconds = 1.0
+        if backward_extension_seconds is None:
+            backward_extension_seconds = 2.0
 
     # Validate inputs
     if direction not in ["coming", "going"]:
@@ -613,30 +628,59 @@ def detect_zipline_segment(
                 duration = max_duration
 
             if duration < min_duration:
-                # Try to extend forward (later in video) if possible
-                available_forward = video_duration - segment_end_time
-                needed_extension = min_duration - duration
+                # For "coming" videos: First try extending backward (earlier), then forward (later)
+                # Step 1: Try extending backward by backward_extension_seconds
+                available_backward = segment_start_time
 
-                if available_forward >= needed_extension:
-                    # Can extend forward
-                    segment_end_time = segment_end_time + needed_extension
-                    duration = min_duration
-                else:
-                    # Can't extend enough, extend as much as possible
-                    segment_end_time = video_duration
+                if available_backward >= backward_extension_seconds:
+                    # Can extend backward
+                    segment_start_time = max(
+                        0.0, segment_start_time - backward_extension_seconds
+                    )
                     duration = segment_end_time - segment_start_time
 
-                    # If still too short, we'll return invalid
+                    # If still too short after backward extension, try forward extension
                     if duration < min_duration:
-                        result = {
-                            "input_video": input_video_path,
-                            "direction": direction,
-                            "valid": False,
-                            "reason": f"Detected duration {duration:.2f}s is below minimum {min_duration}s (even after extending)",
-                        }
-                        if platform_number is not None:
-                            result["platform_number"] = platform_number
-                        return result
+                        available_forward = video_duration - segment_end_time
+                        forward_extension = 2.0  # Extend forward by 2 seconds
+
+                        if available_forward >= forward_extension:
+                            # Can extend forward
+                            segment_end_time = min(
+                                video_duration, segment_end_time + forward_extension
+                            )
+                            duration = segment_end_time - segment_start_time
+                        else:
+                            # Can't extend forward enough, extend as much as possible
+                            segment_end_time = video_duration
+                            duration = segment_end_time - segment_start_time
+                else:
+                    # Can't extend backward enough, try forward extension
+                    available_forward = video_duration - segment_end_time
+                    forward_extension = 2.0  # Extend forward by 2 seconds
+
+                    if available_forward >= forward_extension:
+                        # Can extend forward
+                        segment_end_time = min(
+                            video_duration, segment_end_time + forward_extension
+                        )
+                        duration = segment_end_time - segment_start_time
+                    else:
+                        # Can't extend forward enough, extend as much as possible
+                        segment_end_time = video_duration
+                        duration = segment_end_time - segment_start_time
+
+                # If still too short after both extensions, return invalid
+                if duration < min_duration:
+                    result = {
+                        "input_video": input_video_path,
+                        "direction": direction,
+                        "valid": False,
+                        "reason": f"Detected duration {duration:.2f}s is below minimum {min_duration}s (even after extending backward and forward)",
+                    }
+                    if platform_number is not None:
+                        result["platform_number"] = platform_number
+                    return result
 
             # Final validation
             if duration >= min_duration:
@@ -931,34 +975,55 @@ def detect_zipline_segment(
                     duration = max_duration
 
             if duration < min_duration:
-                # Rule 2: Try to extend forward (backward in time) if possible
-                available_backward = segment_start_time  # How much time before start
-                needed_extension = min_duration - duration
+                # For "going" videos: First try extending forward (later), then backward (earlier)
+                # Step 1: Try extending forward by 2 seconds
+                available_forward = video_duration - segment_end_time
+                forward_extension = 2.0  # Extend forward by 2 seconds
 
-                if available_backward >= needed_extension:
-                    # Can extend backward enough
-                    segment_start_time = segment_start_time - needed_extension
-                    duration = min_duration
-                else:
-                    # Can't extend enough backward, extend as much as possible
-                    segment_start_time = 0.0
+                if available_forward >= forward_extension:
+                    # Can extend forward
+                    segment_end_time = min(
+                        video_duration, segment_end_time + forward_extension
+                    )
                     duration = segment_end_time - segment_start_time
 
-                    # If still too short after extending, check if we can use full segment
+                    # If still too short after forward extension, try backward extension
                     if duration < min_duration:
-                        # Use full segment if it's at least somewhat reasonable
-                        if (
-                            duration >= min_duration * 0.5
-                        ):  # At least 50% of min_duration
-                            # Accept the shorter segment
-                            pass
+                        available_backward = segment_start_time
+
+                        if available_backward >= backward_extension_seconds:
+                            # Can extend backward
+                            segment_start_time = max(
+                                0.0, segment_start_time - backward_extension_seconds
+                            )
+                            duration = segment_end_time - segment_start_time
                         else:
-                            return {
-                                "input_video": input_video_path,
-                                "direction": direction,
-                                "valid": False,
-                                "reason": f"Detected duration {duration:.2f}s is below minimum {min_duration}s (even after extending)",
-                            }
+                            # Can't extend backward enough, extend as much as possible
+                            segment_start_time = 0.0
+                            duration = segment_end_time - segment_start_time
+                else:
+                    # Can't extend forward enough, try backward extension
+                    available_backward = segment_start_time
+
+                    if available_backward >= backward_extension_seconds:
+                        # Can extend backward
+                        segment_start_time = max(
+                            0.0, segment_start_time - backward_extension_seconds
+                        )
+                        duration = segment_end_time - segment_start_time
+                    else:
+                        # Can't extend backward enough, extend as much as possible
+                        segment_start_time = 0.0
+                        duration = segment_end_time - segment_start_time
+
+                # If still too short after both extensions, return invalid
+                if duration < min_duration:
+                    return {
+                        "input_video": input_video_path,
+                        "direction": direction,
+                        "valid": False,
+                        "reason": f"Detected duration {duration:.2f}s is below minimum {min_duration}s (even after extending forward and backward)",
+                    }
 
             # Final validation: ensure we respect min and max constraints
             if duration >= min_duration:
