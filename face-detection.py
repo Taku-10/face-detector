@@ -8,6 +8,85 @@ returning the start and end timestamps for that segment.
 import cv2
 import mediapipe as mp
 from typing import Optional, Dict, Any
+import os
+
+
+def trim_video(
+    input_video_path: str,
+    output_video_path: str,
+    start_time: float,
+    end_time: float,
+) -> bool:
+    """
+    Trims a video from start_time to end_time and saves it to output_video_path.
+
+    Args:
+        input_video_path: Path to the input video file
+        output_video_path: Path where the trimmed video will be saved
+        start_time: Start time in seconds
+        end_time: End time in seconds
+
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        # Open input video
+        cap = cv2.VideoCapture(input_video_path)
+        if not cap.isOpened():
+            return False
+
+        # Get video properties
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        if fps <= 0:
+            cap.release()
+            return False
+
+        # Calculate frame numbers for start and end
+        start_frame = int(start_time * fps)
+        end_frame = int(end_time * fps)
+
+        # Ensure end_frame doesn't exceed total frames
+        end_frame = min(end_frame, total_frames)
+
+        # Create output directory if it doesn't exist
+        output_dir = os.path.dirname(output_video_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        # Set up video writer
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
+
+        if not out.isOpened():
+            cap.release()
+            return False
+
+        # Seek to start frame
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+        # Read and write frames from start to end
+        frame_count = start_frame
+        while frame_count < end_frame:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            out.write(frame)
+            frame_count += 1
+
+        # Release resources
+        cap.release()
+        out.release()
+
+        return True
+
+    except Exception as e:
+        print(f"Error trimming video: {str(e)}")
+        return False
 
 
 # Platform-specific configurations
@@ -25,7 +104,6 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "max_duration": 10.0,
         "ideal_duration": 8.0,
     },
-
 }
 
 
@@ -38,6 +116,7 @@ def detect_zipline_segment(
     platform_number: Optional[int] = None,
     show_frames: bool = False,
     output_video_path: Optional[str] = None,
+    trim_output_path: Optional[str] = None,
 ) -> dict:
     """
     Detects the visible time range of a zipline rider in the video.
@@ -63,6 +142,9 @@ def detect_zipline_segment(
             - Individual parameters can still override platform settings if explicitly provided
         show_frames: If True, displays frames with detection overlay in real-time (default: False)
         output_video_path: Optional path to save video with detection overlay (default: None)
+        trim_output_path: Optional path to save trimmed video segment (default: None)
+            - If provided, creates a trimmed video from start_time to end_time
+            - Only created if detection is valid
 
     Returns:
         dict with:
@@ -74,6 +156,7 @@ def detect_zipline_segment(
             - valid: bool indicating if detection meets criteria
             - reason: optional reason if invalid
             - output_video: path to saved video (if output_video_path was provided)
+            - trimmed_video: path to trimmed video (if trim_output_path was provided and detection valid)
             - platform_number: platform number used (if provided)
 
     Platform Configuration:
@@ -592,6 +675,24 @@ def detect_zipline_segment(
                     result["output_video"] = output_video_path
                 if platform_number is not None:
                     result["platform_number"] = platform_number
+
+                # Trim video if requested (only if detection is valid and times are set)
+                if (
+                    trim_output_path
+                    and result["valid"]
+                    and segment_start_time is not None
+                    and segment_end_time is not None
+                ):
+                    if trim_video(
+                        input_video_path,
+                        trim_output_path,
+                        segment_start_time,
+                        segment_end_time,
+                    ):
+                        result["trimmed_video"] = trim_output_path
+                    else:
+                        result["trim_warning"] = "Failed to create trimmed video"
+
                 return result
             else:
                 result = {
@@ -896,6 +997,24 @@ def detect_zipline_segment(
                     result["output_video"] = output_video_path
                 if platform_number is not None:
                     result["platform_number"] = platform_number
+
+                # Trim video if requested (only if detection is valid and times are set)
+                if (
+                    trim_output_path
+                    and result["valid"]
+                    and segment_start_time is not None
+                    and segment_end_time is not None
+                ):
+                    if trim_video(
+                        input_video_path,
+                        trim_output_path,
+                        segment_start_time,
+                        segment_end_time,
+                    ):
+                        result["trimmed_video"] = trim_output_path
+                    else:
+                        result["trim_warning"] = "Failed to create trimmed video"
+
                 return result
             else:
                 result = {
@@ -923,12 +1042,13 @@ def detect_zipline_segment(
 if __name__ == "__main__":
     # Example usage - modify these values to test with your video
 
-    # Option 1: Use platform-specific configuration
+    # Option 1: Use platform-specific configuration with video trimming
     result = detect_zipline_segment(
         input_video_path="coming-3.MP4",  # Change this to your video path
-        platform_number=2,  # Uses platform 2 settings (direction="going", min_duration=2.0, max_duration=20.0, ideal_duration=8.0)
+        platform_number=2,  # Uses platform 2 settings
         show_frames=True,  # Set to True to display detection in real-time
         # output_video_path="output_with_detections.mp4",  # Optional: save video with overlays
+        trim_output_path="trimmed_output.mp4",  # Optional: save trimmed video segment
     )
 
     # Option 2: Override platform settings with explicit parameters
