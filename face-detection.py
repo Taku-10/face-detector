@@ -158,7 +158,9 @@ def detect_zipline_segment(
         show_frames: If True, displays frames with detection overlay in real-time (default: False)
         output_video_path: Optional path to save video with detection overlay (default: None)
         trim_output_path: Optional path to save trimmed video segment (default: None)
-            - If provided, creates a trimmed video from start_time to end_time
+            - If None, automatically generates path: `output_videos/trimmed-{input_filename}`
+            - Creates "output_videos" directory in the same directory as input video
+            - If provided, uses the specified path
             - Only created if detection is valid
 
     Returns:
@@ -252,6 +254,23 @@ def detect_zipline_segment(
             end_trim_seconds = 1.0
         if backward_extension_seconds is None:
             backward_extension_seconds = 2.0
+
+    # Auto-generate trim_output_path if not provided
+    if trim_output_path is None:
+        # Get the directory and filename from input video path
+        input_dir = os.path.dirname(os.path.abspath(input_video_path))
+        input_filename = os.path.basename(input_video_path)
+
+        # Create output_videos directory in the same directory as input video
+        output_videos_dir = os.path.join(input_dir, "output_videos")
+        if not os.path.exists(output_videos_dir):
+            os.makedirs(output_videos_dir)
+
+        # Generate output filename: trimmed-{original_filename}
+        # Preserve the extension
+        name, ext = os.path.splitext(input_filename)
+        output_filename = f"trimmed-{name}{ext}"
+        trim_output_path = os.path.join(output_videos_dir, output_filename)
 
     # Validate inputs
     if direction not in ["coming", "going"]:
@@ -702,10 +721,9 @@ def detect_zipline_segment(
                 if platform_number is not None:
                     result["platform_number"] = platform_number
 
-                # Trim video if requested (only if detection is valid and times are set)
+                # Trim video automatically (only if detection is valid and times are set)
                 if (
-                    trim_output_path
-                    and result["valid"]
+                    result["valid"]
                     and segment_start_time is not None
                     and segment_end_time is not None
                 ):
@@ -1045,10 +1063,9 @@ def detect_zipline_segment(
                 if platform_number is not None:
                     result["platform_number"] = platform_number
 
-                # Trim video if requested (only if detection is valid and times are set)
+                # Trim video automatically (only if detection is valid and times are set)
                 if (
-                    trim_output_path
-                    and result["valid"]
+                    result["valid"]
                     and segment_start_time is not None
                     and segment_end_time is not None
                 ):
@@ -1089,13 +1106,13 @@ def detect_zipline_segment(
 if __name__ == "__main__":
     # Example usage - modify these values to test with your video
 
-    # Option 1: Use platform-specific configuration with video trimming
+    # Option 1: Use platform-specific configuration with automatic video trimming
     result = detect_zipline_segment(
         input_video_path="coming-new-2.MP4",  # Change this to your video path
         platform_number=2,  # Uses platform 2 settings
         show_frames=True,  # Set to True to display detection in real-time
         # output_video_path="output_with_detections.mp4",  # Optional: save video with overlays
-        trim_output_path="trimmed_output.mp4",  # Optional: save trimmed video segment
+        # trim_output_path is automatically generated as "output_videos/trimmed-coming-new-2.MP4"
     )
 
     # Option 2: Override platform settings with explicit parameters
