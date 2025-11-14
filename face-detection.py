@@ -171,10 +171,16 @@ def detect_zipline_segment(
     "COMING" Videos:
     - Detects when rider approaches from higher platform to camera position
     - Start: First significant motion detection (rider entering frame, filtered from guide motion)
-    - End: When rider motion stops + 1.5s extension for smoother finish
+    - End: start_time + ideal_duration
+      * If (start_time + ideal_duration) >= video_duration: end_time = video_duration - 1.0
+        (removes 1s to crop out guide's hand switching off camera)
+      * If (start_time + ideal_duration) < video_duration: end_time = start_time + ideal_duration
     - Motion detection uses background subtraction to find growing motion patterns
     - Filters out guide's constant small motion, focuses on rider's growing motion
-    - Duration constraints: Must be between min_duration and max_duration
+    - Duration rules:
+      * If duration > max_duration: Trim from end to reach max_duration
+      * If duration < min_duration: Extend forward (later in video) if possible, otherwise use full segment
+      * Final clip must always respect min_duration and max_duration constraints
 
     "GOING" Videos:
     - Detects when rider looks at camera using face detection
@@ -559,67 +565,29 @@ def detect_zipline_segment(
                             segment_start_time = sample["time"]
                             break
 
-                segment_end_time = None  # Will be determined below
-
+                # Determine end time based on ideal_duration
                 if segment_start_time is None:
-                    # No rider motion detected - fallback: use last min_duration seconds
-                    segment_start_time = max(0.0, video_duration - min_duration)
-                    segment_end_time = video_duration
+                    # No rider motion detected - fallback: use segment from (video_duration - ideal_duration) to (video_duration - 1.0)
+                    segment_start_time = max(0.0, video_duration - ideal_duration)
+                    # If end would be at video end, remove 1s to crop guide's hand
+                    if segment_start_time + ideal_duration >= video_duration:
+                        segment_end_time = video_duration - 1.0
+                    else:
+                        segment_end_time = segment_start_time + ideal_duration
                 else:
-                    # Start = first rider detection (filtered from guide)
-                    # End = when rider motion stops (more reliable than face detection)
-                    # Find when motion stops after the start time
-                    start_idx = next(
-                        (
-                            i
-                            for i, s in enumerate(motion_samples)
-                            if s["time"] >= segment_start_time
-                        ),
-                        len(motion_samples) - 1,
-                    )
+                    # New logic for "coming" videos:
+                    # End time = start_time + ideal_duration
+                    # BUT if that reaches video end, remove 1s to crop guide's hand switching off camera
+                    calculated_end_time = segment_start_time + ideal_duration
 
-                    # Look for when motion stops or becomes very small
-                    # Allow for brief gaps (rider might be briefly occluded)
-                    max_area = max(s["area"] for s in motion_with_area)
-                    min_end_area = max_area * 0.05  # 5% of max - very small
-                    gap_tolerance = 3  # Allow up to 3 samples (~0.3s) of no motion
-
-                    last_motion_idx = start_idx
-                    gap_count = 0
-
-                    for i in range(start_idx, len(motion_samples)):
-                        sample = motion_samples[i]
-
-                        if sample["area"] >= min_end_area:
-                            # Motion detected
-                            last_motion_idx = i
-                            gap_count = 0
-                        else:
-                            gap_count += 1
-                            if gap_count >= gap_tolerance:
-                                # Motion has stopped
-                                segment_end_time = motion_samples[last_motion_idx][
-                                    "time"
-                                ]
-                                break
-
-                    # If motion continues to end of video
-                    if segment_end_time is None:
-                        segment_end_time = (
-                            motion_samples[last_motion_idx]["time"]
-                            if last_motion_idx < len(motion_samples)
-                            else video_duration
-                        )
-
-                    # Ensure segment_end_time is set
-                    if segment_end_time is None:
-                        segment_end_time = video_duration
-
-                    # Extend by 1-2 seconds after motion stops for smoother finish
-                    extension_time = 1.5  # 1.5 seconds extension
-                    segment_end_time = min(
-                        video_duration, segment_end_time + extension_time
-                    )
+                    if calculated_end_time >= video_duration:
+                        # End time would be at or past video end, so remove 1s to crop guide's hand
+                        segment_end_time = max(
+                            segment_start_time + 0.1, video_duration - 1.0
+                        )  # Ensure end > start
+                    else:
+                        # End time is before video end, use calculated end time
+                        segment_end_time = calculated_end_time
 
             # Calculate initial duration
             duration = segment_end_time - segment_start_time
@@ -1044,7 +1012,7 @@ if __name__ == "__main__":
 
     # Option 1: Use platform-specific configuration with video trimming
     result = detect_zipline_segment(
-        input_video_path="coming-3.MP4",  # Change this to your video path
+        input_video_path="coming-new-1.MP4",  # Change this to your video path
         platform_number=2,  # Uses platform 2 settings
         show_frames=True,  # Set to True to display detection in real-time
         # output_video_path="output_with_detections.mp4",  # Optional: save video with overlays
