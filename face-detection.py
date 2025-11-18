@@ -637,6 +637,8 @@ def detect_zipline_segment(
                         # End time is before video end, use calculated end time
                         segment_end_time = calculated_end_time
 
+            used_full_video_fallback = False
+
             # Calculate initial duration
             duration = segment_end_time - segment_start_time
 
@@ -691,18 +693,13 @@ def detect_zipline_segment(
 
                 # If still too short after both extensions, return invalid
                 if duration < min_duration:
-                    result = {
-                        "input_video": input_video_path,
-                        "direction": direction,
-                        "valid": False,
-                        "reason": f"Detected duration {duration:.2f}s is below minimum {min_duration}s (even after extending backward and forward)",
-                    }
-                    if platform_number is not None:
-                        result["platform_number"] = platform_number
-                    return result
+                    segment_start_time = 0.0
+                    segment_end_time = video_duration
+                    duration = segment_end_time - segment_start_time
+                    used_full_video_fallback = True
 
             # Final validation
-            if duration >= min_duration:
+            if duration >= min_duration or used_full_video_fallback:
                 if max_duration is not None and duration > max_duration:
                     # Final trim check
                     segment_end_time = segment_start_time + max_duration
@@ -716,6 +713,8 @@ def detect_zipline_segment(
                     "duration": round(duration, 2),
                     "valid": True,
                 }
+                if used_full_video_fallback:
+                    result["fallback"] = "full_video"
                 if output_video_path:
                     result["output_video"] = output_video_path
                 if platform_number is not None:
@@ -724,6 +723,7 @@ def detect_zipline_segment(
                 # Trim video automatically (only if detection is valid and times are set)
                 if (
                     result["valid"]
+                    and not used_full_video_fallback
                     and segment_start_time is not None
                     and segment_end_time is not None
                 ):
@@ -978,6 +978,8 @@ def detect_zipline_segment(
             # Calculate initial duration
             duration = segment_end_time - segment_start_time
 
+            used_full_video_fallback = False
+
             # Apply duration rules:
             # 1. If duration > max_duration: Trim from end to reach ideal_duration (if ideal_duration <= max_duration)
             # 2. If duration < min_duration: Extend forward (backward in time) if possible, otherwise use full segment
@@ -1036,15 +1038,13 @@ def detect_zipline_segment(
 
                 # If still too short after both extensions, return invalid
                 if duration < min_duration:
-                    return {
-                        "input_video": input_video_path,
-                        "direction": direction,
-                        "valid": False,
-                        "reason": f"Detected duration {duration:.2f}s is below minimum {min_duration}s (even after extending forward and backward)",
-                    }
+                    segment_start_time = 0.0
+                    segment_end_time = video_duration
+                    duration = segment_end_time - segment_start_time
+                    used_full_video_fallback = True
 
             # Final validation: ensure we respect min and max constraints
-            if duration >= min_duration:
+            if duration >= min_duration or used_full_video_fallback:
                 if max_duration is not None and duration > max_duration:
                     # Final trim to max_duration
                     segment_end_time = segment_start_time + max_duration
@@ -1058,6 +1058,8 @@ def detect_zipline_segment(
                     "duration": round(duration, 2),
                     "valid": True,
                 }
+                if used_full_video_fallback:
+                    result["fallback"] = "full_video"
                 if output_video_path:
                     result["output_video"] = output_video_path
                 if platform_number is not None:
@@ -1066,6 +1068,7 @@ def detect_zipline_segment(
                 # Trim video automatically (only if detection is valid and times are set)
                 if (
                     result["valid"]
+                    and not used_full_video_fallback
                     and segment_start_time is not None
                     and segment_end_time is not None
                 ):
@@ -1108,8 +1111,8 @@ if __name__ == "__main__":
 
     # Option 1: Use platform-specific configuration with automatic video trimming
     result = detect_zipline_segment(
-        input_video_path="coming-new-2.MP4",  # Change this to your video path
-        platform_number=2,  # Uses platform 2 settings
+        input_video_path="vid29.MP4",  # Change this to your video path
+        platform_number=1,  # Uses platform 2 settings
         show_frames=True,  # Set to True to display detection in real-time
         # output_video_path="output_with_detections.mp4",  # Optional: save video with overlays
         # trim_output_path is automatically generated as "output_videos/trimmed-coming-new-2.MP4"
