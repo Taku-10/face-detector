@@ -7,8 +7,62 @@ returning the start and end timestamps for that segment.
 
 import cv2
 import mediapipe as mp
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Sequence
 import os
+
+
+def is_valid_face_detection(
+    bbox,
+    keypoints: Optional[Sequence[Any]],
+    min_area_ratio: float = 0.01,
+    min_aspect_ratio: float = 0.8,
+    max_aspect_ratio: float = 2.0,
+    min_eye_fraction: float = 0.2,
+    max_eye_fraction: float = 0.8,
+) -> bool:
+    """
+    Applies additional heuristics to reduce false positives (e.g., gloves/hands).
+
+    Args:
+        bbox: MediaPipe relative bounding box (values between 0 and 1).
+        keypoints: Optional relative facial keypoints from MediaPipe.
+    """
+
+    if bbox is None:
+        return False
+
+    width_ratio = bbox.width
+    height_ratio = bbox.height
+
+    if width_ratio <= 0 or height_ratio <= 0:
+        return False
+
+    area_ratio = width_ratio * height_ratio
+    if area_ratio < min_area_ratio:
+        return False
+
+    aspect_ratio = height_ratio / max(width_ratio, 1e-5)
+    if aspect_ratio < min_aspect_ratio or aspect_ratio > max_aspect_ratio:
+        return False
+
+    if keypoints and len(keypoints) >= 2:
+        right_eye = keypoints[0]
+        left_eye = keypoints[1]
+        if (
+            right_eye is None
+            or left_eye is None
+            or right_eye.x is None
+            or left_eye.x is None
+        ):
+            return False
+
+        eye_distance = abs(left_eye.x - right_eye.x)
+        if eye_distance < width_ratio * min_eye_fraction:
+            return False
+        if eye_distance > width_ratio * max_eye_fraction:
+            return False
+
+    return True
 
 
 def trim_video(
@@ -108,6 +162,23 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "end_trim_seconds": 1.0,  # Seconds to remove from end for "coming" videos when reaching video end
         "backward_extension_seconds": 2.0,  # Seconds to extend backward (earlier) when duration is too short
     },
+    3: {
+        "direction": "coming",
+        "min_duration": 3.0,
+        "max_duration": 6.0,
+        "ideal_duration": 5.0,
+        "end_trim_seconds": 1.0,  # Seconds to remove from end for "coming" videos when reaching video end
+        "backward_extension_seconds": 2.0,
+    },
+    4: {
+        "direction": "walking",
+        "min_duration": 3.0,
+        "max_duration": 10.0,
+        "ideal_duration": 6.0,
+        "end_trim_seconds": 0.5,
+        "backward_extension_seconds": 0.0,
+        "is_walking": True,
+    },
 }
 
 
@@ -123,13 +194,14 @@ def detect_zipline_segment(
     show_frames: bool = False,
     output_video_path: Optional[str] = None,
     trim_output_path: Optional[str] = None,
+    is_walking: bool = False,
 ) -> dict:
     """
     Detects the visible time range of a zipline rider in the video.
 
     Args:
         input_video_path: Path to the raw video file
-        direction: Either "coming" or "going" (direction of rider)
+        direction: Either "coming", "going", or "walking" (detection mode)
             - If None and platform_number is provided, uses platform's direction
             - If None and platform_number is not provided, defaults to "coming"
         min_duration: Minimum motion duration to be considered valid (seconds)
@@ -158,6 +230,7 @@ def detect_zipline_segment(
         show_frames: If True, displays frames with detection overlay in real-time (default: False)
         output_video_path: Optional path to save video with detection overlay (default: None)
         trim_output_path: Optional path to save trimmed video segment (default: None)
+        is_walking: If True, forces walking detection logic regardless of direction/platform
             - If None, automatically generates path: `output_videos/trimmed-{input_filename}`
             - Creates "output_videos" directory in the same directory as input video
             - If provided, uses the specified path
@@ -211,6 +284,13 @@ def detect_zipline_segment(
       * If duration > max_duration: Trim from end to reach ideal_duration (if ideal_duration <= max_duration)
       * If duration < min_duration: Extend forward (backward in time) if possible, otherwise use full segment
       * Final clip must always respect min_duration and max_duration constraints
+    "WALKING" Videos:
+    - Detects person walking toward camera with start fixed at 0.0s
+    - Uses face detections to choose clip end time
+      * If video duration <= max_duration: pick detection closest to video end
+      * If video duration > max_duration: pick detection closest to max_duration
+    - Ensures duration stays between min_duration (>=3s) and max_duration (<=10s)
+    - Falls back to full video if constraints cannot be satisfied
     """
     # Apply platform-specific configuration if platform_number is provided
     if platform_number is not None:
@@ -240,6 +320,8 @@ def detect_zipline_segment(
             backward_extension_seconds = platform_config.get(
                 "backward_extension_seconds", 2.0
             )
+        if platform_config.get("is_walking"):
+            is_walking = True
     else:
         # Use defaults if no platform and no explicit values
         if direction is None:
@@ -254,6 +336,11 @@ def detect_zipline_segment(
             end_trim_seconds = 1.0
         if backward_extension_seconds is None:
             backward_extension_seconds = 2.0
+
+    if is_walking:
+        direction = "walking"
+    if direction == "walking":
+        is_walking = True
 
     # Auto-generate trim_output_path if not provided
     if trim_output_path is None:
@@ -273,12 +360,12 @@ def detect_zipline_segment(
         trim_output_path = os.path.join(output_videos_dir, output_filename)
 
     # Validate inputs
-    if direction not in ["coming", "going"]:
+    if direction not in ["coming", "going", "walking"]:
         return {
             "input_video": input_video_path,
             "direction": direction,
             "valid": False,
-            "reason": f"Invalid direction: {direction}. Must be 'coming' or 'going'",
+            "reason": f"Invalid direction: {direction}. Must be 'coming', 'going', or 'walking'",
             "platform_number": platform_number,
         }
 
@@ -435,6 +522,11 @@ def detect_zipline_segment(
 
                         bbox = primary_detection.location_data.relative_bounding_box
                         confidence = primary_detection.score[0]
+
+                        if not is_valid_face_detection(
+                            bbox, primary_detection.location_data.relative_keypoints
+                        ):
+                            continue
 
                         # Convert normalized coordinates to pixel coordinates
                         x = int(bbox.xmin * frame_width)
@@ -749,6 +841,270 @@ def detect_zipline_segment(
                     result["platform_number"] = platform_number
                 return result
 
+        elif is_walking or direction == "walking":
+            direction = "walking"
+
+            # Get video properties
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            video_duration = total_frames / fps if fps > 0 else 0.0
+
+            # Initialize MediaPipe Face Detection
+            mp_face_detection = mp.solutions.face_detection
+            face_detection = mp_face_detection.FaceDetection(
+                model_selection=1,  # 0 for short-range, 1 for full-range
+                min_detection_confidence=0.5,
+            )
+
+            # Face detection parameters
+            frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            min_face_width_px = int(frame_width * 0.06)  # 6% of frame width
+            min_consecutive_hits = 3  # 3 consecutive detections for stability
+
+            # Collect all face detections throughout the video
+            face_detections = []  # List of (time, confidence, bbox) tuples
+            last_faces = []
+            last_detection_confidence = 0.0
+            last_detected_stable = False
+            consecutive_hits = 0
+            last_stable_detection_time = None
+
+            frame_count = 0
+
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                frame_time = frame_count / fps
+
+                if frame_count % sample_interval == 0:
+                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    results = face_detection.process(rgb_frame)
+
+                    detected_stable_frontal = False
+                    last_faces = []
+                    last_detection_confidence = 0.0
+
+                    if results.detections:
+                        primary_detection = max(
+                            results.detections,
+                            key=lambda det: (
+                                det.location_data.relative_bounding_box.width
+                                * det.location_data.relative_bounding_box.height
+                            ),
+                        )
+
+                        bbox = primary_detection.location_data.relative_bounding_box
+                        confidence = primary_detection.score[0]
+
+                        if not is_valid_face_detection(
+                            bbox, primary_detection.location_data.relative_keypoints
+                        ):
+                            continue
+
+                        x = int(bbox.xmin * frame_width)
+                        y = int(bbox.ymin * frame_height)
+                        w = int(bbox.width * frame_width)
+                        h = int(bbox.height * frame_height)
+
+                        x = max(0, x)
+                        y = max(0, y)
+                        w = min(w, frame_width - x)
+                        h = min(h, frame_height - y)
+
+                        if w >= min_face_width_px and h >= min_face_width_px:
+                            if confidence >= 0.5:
+                                detected_stable_frontal = True
+                                last_faces.append((x, y, w, h))
+                                last_detection_confidence = confidence
+
+                    last_detected_stable = detected_stable_frontal
+
+                    if detected_stable_frontal:
+                        consecutive_hits += 1
+                        if consecutive_hits >= min_consecutive_hits:
+                            if (
+                                last_stable_detection_time is None
+                                or (frame_time - last_stable_detection_time) > 0.5
+                            ):
+                                bbox_tuple = last_faces[0] if last_faces else None
+                                face_detections.append(
+                                    {
+                                        "time": frame_time,
+                                        "confidence": last_detection_confidence,
+                                        "bbox": bbox_tuple,
+                                    }
+                                )
+                                last_stable_detection_time = frame_time
+                    else:
+                        consecutive_hits = 0
+
+                if show_frames or output_video_path:
+                    display_frame = frame.copy()
+
+                    for i, (x, y, w, h) in enumerate(last_faces):
+                        cv2.rectangle(
+                            display_frame, (x, y), (x + w, y + h), (255, 0, 0), 3
+                        )
+
+                        if last_detected_stable and i == 0:
+                            cv2.putText(
+                                display_frame,
+                                f"Walking Face ({last_detection_confidence:.2f})",
+                                (x, y - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.6,
+                                (0, 255, 0),
+                                2,
+                            )
+
+                    status_color = (0, 255, 0) if last_detected_stable else (0, 0, 255)
+                    status_text = "DETECTED" if last_detected_stable else "SEARCHING"
+                    cv2.putText(
+                        display_frame,
+                        f"Time: {frame_time:.2f}s | Frame: {frame_count}",
+                        (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (255, 255, 255),
+                        2,
+                    )
+                    cv2.putText(
+                        display_frame,
+                        f"Direction: walking | Status: {status_text}",
+                        (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        status_color,
+                        2,
+                    )
+                    cv2.putText(
+                        display_frame,
+                        f"Detections: {len(face_detections)}",
+                        (10, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (255, 255, 255),
+                        2,
+                    )
+
+                if show_frames:
+                    cv2.imshow("Walking Detection", display_frame)
+                    if cv2.waitKey(30) & 0xFF == ord("q"):
+                        cap.release()
+                        face_detection.close()
+                        if video_writer:
+                            video_writer.release()
+                        cv2.destroyAllWindows()
+                        result = {
+                            "input_video": input_video_path,
+                            "direction": direction,
+                            "valid": False,
+                            "reason": "Detection stopped by user",
+                        }
+                        if platform_number is not None:
+                            result["platform_number"] = platform_number
+                        return result
+
+                if output_video_path and video_writer:
+                    video_writer.write(display_frame)
+
+                frame_count += 1
+
+            cap.release()
+            face_detection.close()
+            if video_writer:
+                video_writer.release()
+            if show_frames:
+                cv2.destroyAllWindows()
+
+            segment_start_time = 0.0
+            used_full_video_fallback = False
+
+            target_end_time = video_duration
+            if max_duration is not None and target_end_time > max_duration:
+                target_end_time = max_duration
+
+            detection_times = [d["time"] for d in face_detections]
+            min_requirement = min_duration if min_duration is not None else 0.0
+            candidate_times = [t for t in detection_times if t >= min_requirement]
+
+            if candidate_times:
+                segment_end_time = min(
+                    candidate_times, key=lambda t: abs(t - target_end_time)
+                )
+            elif detection_times:
+                segment_end_time = min(
+                    detection_times, key=lambda t: abs(t - target_end_time)
+                )
+            else:
+                segment_end_time = target_end_time
+
+            segment_end_time = max(
+                segment_start_time, min(segment_end_time, video_duration)
+            )
+
+            if max_duration is not None and segment_end_time > max_duration:
+                segment_end_time = max_duration
+
+            duration = segment_end_time - segment_start_time
+
+            if duration < min_requirement:
+                if video_duration >= min_requirement:
+                    segment_end_time = min(video_duration, min_requirement)
+                    duration = segment_end_time
+                else:
+                    segment_end_time = video_duration
+                    duration = segment_end_time
+                    used_full_video_fallback = True
+
+            if max_duration is not None and duration > max_duration:
+                segment_end_time = max_duration
+                duration = max_duration
+
+            if duration <= 0:
+                return {
+                    "input_video": input_video_path,
+                    "direction": direction,
+                    "valid": False,
+                    "reason": "Failed to determine walking segment duration",
+                }
+
+            result = {
+                "input_video": input_video_path,
+                "direction": direction,
+                "start_time": round(segment_start_time, 2),
+                "end_time": round(segment_end_time, 2),
+                "duration": round(duration, 2),
+                "valid": True,
+            }
+
+            if used_full_video_fallback:
+                result["fallback"] = "full_video"
+
+            if output_video_path:
+                result["output_video"] = output_video_path
+            if platform_number is not None:
+                result["platform_number"] = platform_number
+
+            if (
+                result["valid"]
+                and not used_full_video_fallback
+                and segment_start_time is not None
+                and segment_end_time is not None
+            ):
+                if trim_video(
+                    input_video_path,
+                    trim_output_path,
+                    segment_start_time,
+                    segment_end_time,
+                ):
+                    result["trimmed_video"] = trim_output_path
+                else:
+                    result["trim_warning"] = "Failed to create trimmed video"
+
+            return result
         else:
             # For "going": detect when rider looks at the camera
             # Strategy: Find all face detections and pick the one that makes the clip closest to min_duration
@@ -815,6 +1171,11 @@ def detect_zipline_segment(
                         # Get bounding box from MediaPipe detection
                         bbox = primary_detection.location_data.relative_bounding_box
                         confidence = primary_detection.score[0]
+
+                        if not is_valid_face_detection(
+                            bbox, primary_detection.location_data.relative_keypoints
+                        ):
+                            continue
 
                         # Convert normalized coordinates to pixel coordinates
                         x = int(bbox.xmin * frame_width)
@@ -1111,8 +1472,8 @@ if __name__ == "__main__":
 
     # Option 1: Use platform-specific configuration with automatic video trimming
     result = detect_zipline_segment(
-        input_video_path="vid29.MP4",  # Change this to your video path
-        platform_number=1,  # Uses platform 2 settings
+        input_video_path="bw4.MP4",  # Change this to your video path
+        platform_number=4,  # Uses platform 2 settings
         show_frames=True,  # Set to True to display detection in real-time
         # output_video_path="output_with_detections.mp4",  # Optional: save video with overlays
         # trim_output_path is automatically generated as "output_videos/trimmed-coming-new-2.MP4"
