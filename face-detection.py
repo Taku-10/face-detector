@@ -65,6 +65,18 @@ def is_valid_face_detection(
     return True
 
 
+def apply_start_offset(
+    start_time: Optional[float], offset_seconds: float
+) -> Optional[float]:
+    """Helper to shift the start time earlier when possible."""
+    if start_time is None:
+        return None
+    if offset_seconds is None or offset_seconds <= 0:
+        return start_time
+    shift = min(offset_seconds, start_time)
+    return max(0.0, start_time - shift)
+
+
 def trim_video(
     input_video_path: str,
     output_video_path: str,
@@ -152,6 +164,7 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "ideal_duration": 8.0,
         "end_trim_seconds": 0.0,
         "backward_extension_seconds": 2.0,
+        "start_offset_seconds": 0.0,
     },
     2: {
         "direction": "coming",
@@ -160,6 +173,7 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "ideal_duration": 8.0,
         "end_trim_seconds": 1.0,
         "backward_extension_seconds": 2.0,
+        "start_offset_seconds": 0.0,
     },
     3: {
         "direction": "coming",
@@ -168,6 +182,7 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "ideal_duration": 5.0,
         "end_trim_seconds": 1.0,
         "backward_extension_seconds": 2.0,
+        "start_offset_seconds": 0.0,
     },
     4: {
         "direction": "walking",
@@ -177,6 +192,7 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "end_trim_seconds": 0.0,
         "backward_extension_seconds": 0.0,
         "is_walking": True,
+        "start_offset_seconds": 0.0,
     },
     5: {
         "direction": "walking",
@@ -186,6 +202,7 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "end_trim_seconds": 0.0,
         "backward_extension_seconds": 0.0,
         "is_walking": True,
+        "start_offset_seconds": 0.0,
     },
     6: {
         "direction": "kitting",
@@ -194,6 +211,7 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "ideal_duration": 30.0,
         "end_trim_seconds": 0.0,
         "backward_extension_seconds": 0.0,
+        "start_offset_seconds": 0.0,
     },
     7: {
         "direction": "sitting",
@@ -202,6 +220,7 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "ideal_duration": 40.0,
         "end_trim_seconds": 0.0,
         "backward_extension_seconds": 0.0,
+        "start_offset_seconds": 0.0,
     },
 }
 
@@ -219,6 +238,7 @@ def detect_zipline_segment(
     output_video_path: Optional[str] = None,
     trim_output_path: Optional[str] = None,
     is_walking: bool = False,
+    start_offset_seconds: Optional[float] = None,
 ) -> dict:
     """
     Detects the visible time range of a zipline rider in the video.
@@ -259,6 +279,10 @@ def detect_zipline_segment(
             - Creates "output_videos" directory in the same directory as input video
             - If provided, uses the specified path
             - Only created if detection is valid
+        start_offset_seconds: Optional number of seconds to shift the detected start earlier
+            - Example: detected start = 7s, offset = 2s ⇒ final start = 5s (clamped to >= 0)
+            - Ignored when <= 0 or when start is already near 0
+            - If platform_number is provided and this is None, uses the platform's configured start_offset_seconds
 
     Returns:
         dict with:
@@ -281,6 +305,7 @@ def detect_zipline_segment(
         - ideal_duration: ideal clip duration
         - end_trim_seconds: seconds to remove from end for "coming" videos when reaching video end
         - backward_extension_seconds: seconds to extend backward (earlier) when duration is too short
+        - start_offset_seconds: seconds to shift detected start earlier (per platform)
 
     Detection Logic:
 
@@ -368,6 +393,8 @@ def detect_zipline_segment(
             )
         if platform_config.get("is_walking"):
             is_walking = True
+        if start_offset_seconds is None:
+            start_offset_seconds = platform_config.get("start_offset_seconds", 0.0)
     else:
         # Use defaults if no platform and no explicit values
         if direction is None:
@@ -382,6 +409,9 @@ def detect_zipline_segment(
             end_trim_seconds = 1.0
         if backward_extension_seconds is None:
             backward_extension_seconds = 2.0
+
+    if start_offset_seconds is None or start_offset_seconds < 0:
+        start_offset_seconds = 0.0
 
     if is_walking:
         direction = "walking"
@@ -779,7 +809,15 @@ def detect_zipline_segment(
 
             used_full_video_fallback = False
 
+            segment_start_time = apply_start_offset(
+                segment_start_time, start_offset_seconds
+            )
+
             # Calculate initial duration
+            segment_start_time = apply_start_offset(
+                segment_start_time, start_offset_seconds
+            )
+
             duration = segment_end_time - segment_start_time
 
             # Apply duration constraints
@@ -1517,6 +1555,14 @@ def detect_zipline_segment(
                 # No faces detected - use video end
                 segment_end_time = video_duration
 
+            segment_start_time = apply_start_offset(
+                segment_start_time, start_offset_seconds
+            )
+
+            segment_start_time = apply_start_offset(
+                segment_start_time, start_offset_seconds
+            )
+
             # Calculate duration
             duration = segment_end_time - segment_start_time
 
@@ -2061,6 +2107,10 @@ def detect_zipline_segment(
                     # Fallback: use the earliest detection
                     segment_start_time = face_detections[0]["time"]
 
+            segment_start_time = apply_start_offset(
+                segment_start_time, start_offset_seconds
+            )
+
             # Calculate initial duration
             duration = segment_end_time - segment_start_time
 
@@ -2193,10 +2243,9 @@ def detect_zipline_segment(
 
 
 if __name__ == "__main__":
-    
     result = detect_zipline_segment(
-        input_video_path="tbw2.MP4",
-        platform_number=4,
+        input_video_path="tcoming-1.MP4",
+        platform_number=2,
         show_frames=True,
     )
 
