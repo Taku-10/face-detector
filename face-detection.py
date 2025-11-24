@@ -144,30 +144,29 @@ def trim_video(
 
 
 # Platform-specific configurations
-# Each platform can have its own min_duration, max_duration, ideal_duration, and direction
 PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
     1: {
         "direction": "going",
         "min_duration": 5.0,
         "max_duration": 10.0,
         "ideal_duration": 8.0,
-        "end_trim_seconds": 0.0,  # Seconds to remove from end for "coming" videos when reaching video end
-        "backward_extension_seconds": 2.0,  # Seconds to extend backward (earlier) when duration is too short
+        "end_trim_seconds": 0.0,
+        "backward_extension_seconds": 2.0,
     },
     2: {
         "direction": "coming",
         "min_duration": 5.0,
         "max_duration": 10.0,
         "ideal_duration": 8.0,
-        "end_trim_seconds": 1.0,  # Seconds to remove from end for "coming" videos when reaching video end
-        "backward_extension_seconds": 2.0,  # Seconds to extend backward (earlier) when duration is too short
+        "end_trim_seconds": 1.0,
+        "backward_extension_seconds": 2.0,
     },
     3: {
         "direction": "coming",
         "min_duration": 3.0,
         "max_duration": 6.0,
         "ideal_duration": 5.0,
-        "end_trim_seconds": 1.0,  # Seconds to remove from end for "coming" videos when reaching video end
+        "end_trim_seconds": 1.0,
         "backward_extension_seconds": 2.0,
     },
     4: {
@@ -175,9 +174,34 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "min_duration": 3.0,
         "max_duration": 10.0,
         "ideal_duration": 6.0,
-        "end_trim_seconds": 0.5,
+        "end_trim_seconds": 0.0,
         "backward_extension_seconds": 0.0,
         "is_walking": True,
+    },
+    5: {
+        "direction": "walking",
+        "min_duration": 12.0,
+        "max_duration": 20.0,
+        "ideal_duration": 10.0,
+        "end_trim_seconds": 0.0,
+        "backward_extension_seconds": 0.0,
+        "is_walking": True,
+    },
+    6: {
+        "direction": "kitting",
+        "min_duration": 20.0,
+        "max_duration": 60.0,
+        "ideal_duration": 30.0,
+        "end_trim_seconds": 0.0,
+        "backward_extension_seconds": 0.0,
+    },
+    7: {
+        "direction": "sitting",
+        "min_duration": 25.0,
+        "max_duration": 60.0,
+        "ideal_duration": 40.0,
+        "end_trim_seconds": 0.0,
+        "backward_extension_seconds": 0.0,
     },
 }
 
@@ -201,7 +225,7 @@ def detect_zipline_segment(
 
     Args:
         input_video_path: Path to the raw video file
-        direction: Either "coming", "going", or "walking" (detection mode)
+        direction: Either "coming", "going", "walking", "kitting", or "sitting" (detection mode)
             - If None and platform_number is provided, uses platform's direction
             - If None and platform_number is not provided, defaults to "coming"
         min_duration: Minimum motion duration to be considered valid (seconds)
@@ -291,6 +315,28 @@ def detect_zipline_segment(
       * If video duration > max_duration: pick detection closest to max_duration
     - Ensures duration stays between min_duration (>=3s) and max_duration (<=10s)
     - Falls back to full video if constraints cannot be satisfied
+
+    "KITTING" Videos:
+    - Detects group of people standing, then one at a time walking toward camera
+    - Start: First person movement detected (first person starts walking)
+    - End: Last face detection closest to video end (last face we see)
+    - Uses motion detection (background subtraction) to detect when first person starts walking
+    - Uses face detection to find the last visible face
+    - Duration rules:
+      * If duration > max_duration: Trim from end to reach max_duration
+      * If duration < min_duration: Extend forward (later in video) if possible
+      * Final clip must always respect min_duration and max_duration constraints
+
+    "SITTING" Videos:
+    - Detects people seated, camera focuses on each person sequentially
+    - Start: First face detected (first person in focus)
+    - End: Last face detected (closest to video end)
+    - Uses face detection only (no motion detection needed)
+    - Simple approach: tracks all face detections, uses first and last
+    - Duration rules:
+      * If duration > max_duration: Trim from end to reach max_duration
+      * If duration < min_duration: Extend forward (later in video) if possible
+      * Final clip must always respect min_duration and max_duration constraints
     """
     # Apply platform-specific configuration if platform_number is provided
     if platform_number is not None:
@@ -360,12 +406,12 @@ def detect_zipline_segment(
         trim_output_path = os.path.join(output_videos_dir, output_filename)
 
     # Validate inputs
-    if direction not in ["coming", "going", "walking"]:
+    if direction not in ["coming", "going", "walking", "kitting", "sitting"]:
         return {
             "input_video": input_video_path,
             "direction": direction,
             "valid": False,
-            "reason": f"Invalid direction: {direction}. Must be 'coming', 'going', or 'walking'",
+            "reason": f"Invalid direction: {direction}. Must be 'coming', 'going', 'walking', 'kitting', or 'sitting'",
             "platform_number": platform_number,
         }
 
@@ -529,6 +575,8 @@ def detect_zipline_segment(
                             continue
 
                         # Convert normalized coordinates to pixel coordinates
+                        x = int(bbox.xmin * frame_width)
+                        y = int(bbox.ymin * frame_height)
                         x = int(bbox.xmin * frame_width)
                         y = int(bbox.ymin * frame_height)
                         w = int(bbox.width * frame_width)
@@ -1105,6 +1153,683 @@ def detect_zipline_segment(
                     result["trim_warning"] = "Failed to create trimmed video"
 
             return result
+        elif direction == "kitting":
+            # For "kitting": group of people standing, then one at a time they walk toward camera
+            # Start: First person detected walking (face + significant motion)
+            # End: Last person detected (last face that disappears)
+
+            # Get video properties
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            video_duration = total_frames / fps if fps > 0 else 0.0
+
+            # Initialize background subtractor for motion detection
+            bg_subtractor = cv2.createBackgroundSubtractorMOG2(
+                history=500, varThreshold=50, detectShadows=True
+            )
+
+            # Initialize MediaPipe Face Detection
+            mp_face_detection = mp.solutions.face_detection
+            face_detection = mp_face_detection.FaceDetection(
+                model_selection=1,  # 0 for short-range, 1 for full-range
+                min_detection_confidence=0.5,
+            )
+
+            # Initialize MediaPipe Pose for full body detection
+            mp_pose = mp.solutions.pose
+            pose = mp_pose.Pose(
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+
+            # Face detection parameters
+            frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            min_face_width_px = int(frame_width * 0.06)  # 6% of frame width
+
+            # Motion detection threshold (for kitting: walking motion)
+            frame_area = frame_width * frame_height
+            min_motion_area = (
+                frame_area * 0.02
+            )  # 2% of frame - walking motion threshold
+
+            # Track detections - person presence (face + motion together indicates walking)
+            person_detections = []  # List of (time, has_face, has_motion, motion_area) tuples
+            face_records = []  # Track detailed face detections for end time
+
+            frame_count = 0
+            results = None
+            pose_results = None
+
+            # First pass: collect all person detection data
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                frame_time = frame_count / fps
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+                # Detect faces on all frames
+                face_results = face_detection.process(rgb_frame)
+                has_face = False
+                if face_results.detections:
+                    # Check if face is valid and large enough
+                    for det in face_results.detections:
+                        bbox = det.location_data.relative_bounding_box
+                        confidence = det.score[0]
+
+                        if not is_valid_face_detection(
+                            bbox, det.location_data.relative_keypoints
+                        ):
+                            continue
+
+                        x = int(bbox.xmin * frame_width)
+                        y = int(bbox.ymin * frame_height)
+                        w = int(bbox.width * frame_width)
+                        h = int(bbox.height * frame_height)
+
+                        # Clamp to frame bounds
+                        x = max(0, min(x, frame_width - 1))
+                        y = max(0, min(y, frame_height - 1))
+                        w = max(0, min(w, frame_width - x))
+                        h = max(0, min(h, frame_height - y))
+
+                        if (
+                            w >= min_face_width_px
+                            and h >= min_face_width_px
+                            and confidence >= 0.5
+                        ):
+                            has_face = True
+                            face_records.append(
+                                {
+                                    "time": frame_time,
+                                    "area": float(w * h),
+                                    "width": float(w),
+                                    "height": float(h),
+                                    "center_x": float(x + w / 2),
+                                    "center_y": float(y + h / 2),
+                                }
+                            )
+                            break
+
+                # Detect motion on sampled frames
+                has_motion = False
+                motion_area = 0.0
+                if frame_count % sample_interval == 0:
+                    fg_mask = bg_subtractor.apply(frame)
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
+                    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+
+                    contours, _ = cv2.findContours(
+                        fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                    )
+
+                    if contours:
+                        largest_contour = max(contours, key=cv2.contourArea)
+                        area = cv2.contourArea(largest_contour)
+                        motion_area = float(area)
+
+                        if motion_area >= min_motion_area:
+                            has_motion = True
+
+                # Detect pose (full body) on sampled frames
+                has_person_body = False
+                if frame_count % sample_interval == 0:
+                    pose_results = pose.process(rgb_frame)
+                    if pose_results and pose_results.pose_landmarks:
+                        # Check if we have enough keypoints to indicate a person
+                        # Require at least torso/hip keypoints
+                        landmarks = pose_results.pose_landmarks.landmark
+                        # Check for key body points (shoulders, hips)
+                        if (
+                            landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER].visibility
+                            > 0.5
+                            or landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER].visibility
+                            > 0.5
+                            or landmarks[mp_pose.PoseLandmark.LEFT_HIP].visibility > 0.5
+                            or landmarks[mp_pose.PoseLandmark.RIGHT_HIP].visibility
+                            > 0.5
+                        ):
+                            has_person_body = True
+                else:
+                    # For non-sampled frames, still process pose for display
+                    pose_results = pose.process(rgb_frame)
+
+                # Store person detection: person is "walking" if they have face AND (motion OR body detected)
+                # This filters out people just standing (no motion) vs walking (has motion)
+                is_person_walking = has_face and (has_motion or has_person_body)
+
+                person_detections.append(
+                    {
+                        "time": frame_time,
+                        "has_face": has_face,
+                        "has_motion": has_motion,
+                        "has_person_body": has_person_body,
+                        "is_walking": is_person_walking,
+                        "motion_area": motion_area,
+                    }
+                )
+
+                results = face_results
+
+                # Get current detection state for display
+                current_detection = person_detections[-1] if person_detections else None
+
+                # Create display frame with overlays if needed
+                if show_frames or output_video_path:
+                    display_frame = frame.copy()
+
+                    # Draw face detection
+                    if results and results.detections:
+                        for det in results.detections:
+                            bbox = det.location_data.relative_bounding_box
+                            x = int(bbox.xmin * frame_width)
+                            y = int(bbox.ymin * frame_height)
+                            w = int(bbox.width * frame_width)
+                            h = int(bbox.height * frame_height)
+                            cv2.rectangle(
+                                display_frame, (x, y), (x + w, y + h), (255, 0, 0), 3
+                            )
+
+                    # Draw pose landmarks if detected
+                    if pose_results and pose_results.pose_landmarks:
+                        mp_drawing = mp.solutions.drawing_utils
+                        mp_drawing.draw_landmarks(
+                            display_frame,
+                            pose_results.pose_landmarks,
+                            mp_pose.POSE_CONNECTIONS,
+                        )
+
+                    # Add overlay info
+                    cv2.putText(
+                        display_frame,
+                        f"Time: {frame_time:.2f}s | Frame: {frame_count}",
+                        (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (255, 255, 255),
+                        2,
+                    )
+                    cv2.putText(
+                        display_frame,
+                        f"Direction: {direction}",
+                        (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (255, 255, 255),
+                        2,
+                    )
+
+                    # Show person detection status
+                    if current_detection:
+                        status = (
+                            "WALKING" if current_detection["is_walking"] else "STANDING"
+                        )
+                        status_color = (
+                            (0, 255, 0)
+                            if current_detection["is_walking"]
+                            else (0, 0, 255)
+                        )
+                        cv2.putText(
+                            display_frame,
+                            f"Person: {status} | Face: {current_detection['has_face']} | Motion: {current_detection['has_motion']}",
+                            (10, 90),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            status_color,
+                            2,
+                        )
+                        cv2.putText(
+                            display_frame,
+                            f"Faces detected: {len(face_records)}",
+                            (10, 120),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (255, 255, 255),
+                            2,
+                        )
+
+                # Show frame with overlay
+                if show_frames:
+                    cv2.imshow("Kitting Detection", display_frame)
+                    if cv2.waitKey(30) & 0xFF == ord("q"):
+                        cap.release()
+                        face_detection.close()
+                        if video_writer:
+                            video_writer.release()
+                        cv2.destroyAllWindows()
+                        result = {
+                            "input_video": input_video_path,
+                            "direction": direction,
+                            "valid": False,
+                            "reason": "Detection stopped by user",
+                        }
+                        if platform_number is not None:
+                            result["platform_number"] = platform_number
+                        return result
+
+                # Write frame to output video if requested
+                if output_video_path and video_writer:
+                    video_writer.write(display_frame)
+
+                frame_count += 1
+
+            cap.release()
+            face_detection.close()
+            pose.close()
+            if video_writer:
+                video_writer.release()
+            if show_frames:
+                cv2.destroyAllWindows()
+
+            # Determine start and end times using person detections
+            # Start: First person detected walking (face + motion/body)
+            # End: Last person detected (last face that disappears)
+
+            # Find periods where people are walking (sustained person detections)
+            walking_periods = []  # List of (start_time, end_time) for each person walking
+            current_walking_start = None
+            min_walking_duration = (
+                0.5  # Person must be detected walking for at least 0.5 seconds
+            )
+            consecutive_walking_frames = 0
+            required_consecutive = int(
+                fps * min_walking_duration / sample_interval
+            )  # Convert to sample count
+
+            for detection in person_detections:
+                if detection["is_walking"]:
+                    if current_walking_start is None:
+                        # Start of a new walking period
+                        current_walking_start = detection["time"]
+                        consecutive_walking_frames = 1
+                    else:
+                        consecutive_walking_frames += 1
+                else:
+                    if current_walking_start is not None:
+                        # End of walking period - check if it was sustained
+                        if consecutive_walking_frames >= required_consecutive:
+                            # This is a sustained walking period
+                            walking_periods.append(
+                                (current_walking_start, detection["time"])
+                            )
+                        current_walking_start = None
+                        consecutive_walking_frames = 0
+
+            # Handle case where walking continues to end of video
+            if (
+                current_walking_start is not None
+                and consecutive_walking_frames >= required_consecutive
+            ):
+                walking_periods.append((current_walking_start, video_duration))
+
+            # Start: First person walking (first walking period)
+            if walking_periods:
+                segment_start_time = walking_periods[0][0]
+            else:
+                # No walking periods found - look for first person with face + motion
+                for detection in person_detections:
+                    if detection["has_face"] and detection["has_motion"]:
+                        segment_start_time = detection["time"]
+                        break
+                else:
+                    # Fallback: use first face detection
+                    if face_records:
+                        segment_start_time = face_records[0]["time"]
+                    else:
+                        segment_start_time = 0.0
+
+            # Add a small pre-roll so we catch the person before they move too far
+            start_padding_seconds = 0.8  # Capture ~1 second before detected walking
+            if segment_start_time > 0:
+                segment_start_time = max(
+                    0.0, segment_start_time - start_padding_seconds
+                )
+
+            # End: Last person facing the camera (use strongest face detection near the end)
+            if face_records:
+                relevant_faces = [
+                    face for face in face_records if face["time"] >= segment_start_time
+                ]
+                if not relevant_faces:
+                    relevant_faces = face_records
+
+                # Focus on the final window (e.g., last 1.5s of faces)
+                last_face_time = relevant_faces[-1]["time"]
+                end_window_seconds = 1.5
+                window_faces = [
+                    face
+                    for face in relevant_faces
+                    if face["time"] >= last_face_time - end_window_seconds
+                ]
+                if not window_faces:
+                    window_faces = relevant_faces
+
+                # Pick the face with the largest area in this final window
+                chosen_face = max(window_faces, key=lambda face: face["area"])
+
+                end_padding_seconds = 0.4
+                segment_end_time = min(
+                    video_duration, chosen_face["time"] + end_padding_seconds
+                )
+            else:
+                # No faces detected - use video end
+                segment_end_time = video_duration
+
+            # Calculate duration
+            duration = segment_end_time - segment_start_time
+
+            # Apply duration constraints
+            if max_duration is not None and duration > max_duration:
+                # Trim from the end to reach max_duration
+                segment_end_time = segment_start_time + max_duration
+                duration = max_duration
+
+            if duration < min_duration:
+                # Try extending forward (later) if possible
+                available_forward = video_duration - segment_end_time
+                forward_extension = min_duration - duration
+
+                if available_forward >= forward_extension:
+                    segment_end_time = min(
+                        video_duration, segment_end_time + forward_extension
+                    )
+                    duration = segment_end_time - segment_start_time
+                else:
+                    # Extend as much as possible
+                    segment_end_time = video_duration
+                    duration = segment_end_time - segment_start_time
+
+            # Final validation
+            if duration >= min_duration or duration > 0:
+                if max_duration is not None and duration > max_duration:
+                    segment_end_time = segment_start_time + max_duration
+                    duration = max_duration
+
+                result = {
+                    "input_video": input_video_path,
+                    "direction": direction,
+                    "start_time": round(segment_start_time, 2),
+                    "end_time": round(segment_end_time, 2),
+                    "duration": round(duration, 2),
+                    "valid": True,
+                }
+                if output_video_path:
+                    result["output_video"] = output_video_path
+                if platform_number is not None:
+                    result["platform_number"] = platform_number
+
+                # Trim video automatically
+                if (
+                    result["valid"]
+                    and segment_start_time is not None
+                    and segment_end_time is not None
+                ):
+                    if trim_video(
+                        input_video_path,
+                        trim_output_path,
+                        segment_start_time,
+                        segment_end_time,
+                    ):
+                        result["trimmed_video"] = trim_output_path
+                    else:
+                        result["trim_warning"] = "Failed to create trimmed video"
+
+                return result
+            else:
+                result = {
+                    "input_video": input_video_path,
+                    "direction": direction,
+                    "valid": False,
+                    "reason": f"Detected duration {duration:.2f}s is below minimum {min_duration}s",
+                }
+                if platform_number is not None:
+                    result["platform_number"] = platform_number
+                return result
+        elif direction == "sitting":
+            # For "sitting": people seated, camera focuses on each person sequentially
+            # Start: First face detected
+            # End: Last face detected (closest to video end)
+
+            # Get video properties
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            video_duration = total_frames / fps if fps > 0 else 0.0
+
+            # Initialize MediaPipe Face Detection
+            mp_face_detection = mp.solutions.face_detection
+            face_detection = mp_face_detection.FaceDetection(
+                model_selection=1,  # 0 for short-range, 1 for full-range
+                min_detection_confidence=0.5,
+            )
+
+            # Face detection parameters
+            frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            min_face_width_px = int(frame_width * 0.06)  # 6% of frame width
+
+            # Track face detections
+            face_detections = []  # List of face detection times
+            first_face_time = None
+            last_face_time = None
+
+            frame_count = 0
+            results = None
+
+            # Process video to detect faces
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                frame_time = frame_count / fps
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+                # Detect faces
+                results = face_detection.process(rgb_frame)
+
+                if results.detections:
+                    # Select the detection with largest bounding box
+                    primary_detection = max(
+                        results.detections,
+                        key=lambda det: (
+                            det.location_data.relative_bounding_box.width
+                            * det.location_data.relative_bounding_box.height
+                        ),
+                    )
+
+                    bbox = primary_detection.location_data.relative_bounding_box
+                    confidence = primary_detection.score[0]
+
+                    if not is_valid_face_detection(
+                        bbox, primary_detection.location_data.relative_keypoints
+                    ):
+                        continue
+
+                    # Convert normalized coordinates to pixel coordinates
+                    x = int(bbox.xmin * frame_width)
+                    y = int(bbox.ymin * frame_height)
+                    w = int(bbox.width * frame_width)
+                    h = int(bbox.height * frame_height)
+
+                    # Ensure coordinates are within frame bounds
+                    x = max(0, x)
+                    y = max(0, y)
+                    w = min(w, frame_width - x)
+                    h = min(h, frame_height - y)
+
+                    # Check if face is large enough
+                    if w >= min_face_width_px and h >= min_face_width_px:
+                        if confidence >= 0.5:
+                            face_detections.append(frame_time)
+
+                            # Track first and last face
+                            if first_face_time is None:
+                                first_face_time = frame_time
+                            last_face_time = frame_time
+
+                # Create display frame with overlays if needed
+                if show_frames or output_video_path:
+                    display_frame = frame.copy()
+
+                    # Draw face detection
+                    if results and results.detections:
+                        for det in results.detections:
+                            bbox = det.location_data.relative_bounding_box
+                            x = int(bbox.xmin * frame_width)
+                            y = int(bbox.ymin * frame_height)
+                            w = int(bbox.width * frame_width)
+                            h = int(bbox.height * frame_height)
+                            cv2.rectangle(
+                                display_frame, (x, y), (x + w, y + h), (255, 0, 0), 3
+                            )
+
+                    # Add overlay info
+                    cv2.putText(
+                        display_frame,
+                        f"Time: {frame_time:.2f}s | Frame: {frame_count}",
+                        (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (255, 255, 255),
+                        2,
+                    )
+                    cv2.putText(
+                        display_frame,
+                        f"Direction: {direction}",
+                        (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (255, 255, 255),
+                        2,
+                    )
+                    cv2.putText(
+                        display_frame,
+                        f"Faces detected: {len(face_detections)}",
+                        (10, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (255, 255, 255),
+                        2,
+                    )
+
+                # Show frame with overlay
+                if show_frames:
+                    cv2.imshow("Sitting Detection", display_frame)
+                    if cv2.waitKey(30) & 0xFF == ord("q"):
+                        cap.release()
+                        face_detection.close()
+                        if video_writer:
+                            video_writer.release()
+                        cv2.destroyAllWindows()
+                        result = {
+                            "input_video": input_video_path,
+                            "direction": direction,
+                            "valid": False,
+                            "reason": "Detection stopped by user",
+                        }
+                        if platform_number is not None:
+                            result["platform_number"] = platform_number
+                        return result
+
+                # Write frame to output video if requested
+                if output_video_path and video_writer:
+                    video_writer.write(display_frame)
+
+                frame_count += 1
+
+            cap.release()
+            face_detection.close()
+            if video_writer:
+                video_writer.release()
+            if show_frames:
+                cv2.destroyAllWindows()
+
+            # Determine start and end times
+            # Start: First face detected
+            if first_face_time is None:
+                # No face detected - fallback: use video start
+                segment_start_time = 0.0
+            else:
+                segment_start_time = first_face_time
+
+            # End: Last face detected (closest to video end)
+            if last_face_time is None:
+                # No face detected - fallback: use video end
+                segment_end_time = video_duration
+            else:
+                segment_end_time = last_face_time
+
+            # Calculate duration
+            duration = segment_end_time - segment_start_time
+
+            # Apply duration constraints
+            if max_duration is not None and duration > max_duration:
+                # Trim from the end to reach max_duration
+                segment_end_time = segment_start_time + max_duration
+                duration = max_duration
+
+            if duration < min_duration:
+                # Try extending forward (later) if possible
+                available_forward = video_duration - segment_end_time
+                forward_extension = min_duration - duration
+
+                if available_forward >= forward_extension:
+                    segment_end_time = min(
+                        video_duration, segment_end_time + forward_extension
+                    )
+                    duration = segment_end_time - segment_start_time
+                else:
+                    # Extend as much as possible
+                    segment_end_time = video_duration
+                    duration = segment_end_time - segment_start_time
+
+            # Final validation
+            if duration >= min_duration or duration > 0:
+                if max_duration is not None and duration > max_duration:
+                    segment_end_time = segment_start_time + max_duration
+                    duration = max_duration
+
+                result = {
+                    "input_video": input_video_path,
+                    "direction": direction,
+                    "start_time": round(segment_start_time, 2),
+                    "end_time": round(segment_end_time, 2),
+                    "duration": round(duration, 2),
+                    "valid": True,
+                }
+                if output_video_path:
+                    result["output_video"] = output_video_path
+                if platform_number is not None:
+                    result["platform_number"] = platform_number
+
+                # Trim video automatically
+                if (
+                    result["valid"]
+                    and segment_start_time is not None
+                    and segment_end_time is not None
+                ):
+                    if trim_video(
+                        input_video_path,
+                        trim_output_path,
+                        segment_start_time,
+                        segment_end_time,
+                    ):
+                        result["trimmed_video"] = trim_output_path
+                    else:
+                        result["trim_warning"] = "Failed to create trimmed video"
+
+                return result
+            else:
+                result = {
+                    "input_video": input_video_path,
+                    "direction": direction,
+                    "valid": False,
+                    "reason": f"Detected duration {duration:.2f}s is below minimum {min_duration}s",
+                }
+                if platform_number is not None:
+                    result["platform_number"] = platform_number
+                return result
         else:
             # For "going": detect when rider looks at the camera
             # Strategy: Find all face detections and pick the one that makes the clip closest to min_duration
@@ -1468,36 +2193,13 @@ def detect_zipline_segment(
 
 
 if __name__ == "__main__":
-    # Example usage - modify these values to test with your video
-
-    # Option 1: Use platform-specific configuration with automatic video trimming
+    
     result = detect_zipline_segment(
-        input_video_path="bw4.MP4",  # Change this to your video path
-        platform_number=4,  # Uses platform 2 settings
-        show_frames=True,  # Set to True to display detection in real-time
-        # output_video_path="output_with_detections.mp4",  # Optional: save video with overlays
-        # trim_output_path is automatically generated as "output_videos/trimmed-coming-new-2.MP4"
+        input_video_path="tbw2.MP4",
+        platform_number=4,
+        show_frames=True,
     )
 
-    # Option 2: Override platform settings with explicit parameters
-    # result = detect_zipline_segment(
-    #     input_video_path="coming-new-3.MP4",
-    #     platform_number=2,  # Base settings from platform 2
-    #     ideal_duration=10.0,  # Override ideal_duration to 10.0
-    #     show_frames=True,
-    # )
-
-    # Option 3: Use explicit parameters without platform
-    # result = detect_zipline_segment(
-    #     input_video_path="coming-new-3.MP4",
-    #     direction="going",
-    #     min_duration=2.0,
-    #     max_duration=20.0,
-    #     ideal_duration=8.0,
-    #     show_frames=True,
-    # )
-
-    # Print results
     import json
 
     print(json.dumps(result, indent=2))
