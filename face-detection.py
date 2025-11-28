@@ -223,6 +223,10 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "end_trim_seconds": 0.0,
         "backward_extension_seconds": 2.0,
         "start_offset_seconds": 0.0,
+        "capture_images": True,
+        "capture_images_mode": "going",
+        "capture_images_min": 1,
+        "capture_images_max": 5,
     },
     2: {
         "direction": "coming",
@@ -232,6 +236,10 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "end_trim_seconds": 1.0,
         "backward_extension_seconds": 2.0,
         "start_offset_seconds": 0.0,
+        "capture_images": True,
+        "capture_images_mode": "coming",
+        "capture_images_min": 1,
+        "capture_images_max": 5,
     },
     3: {
         "direction": "walking",
@@ -242,6 +250,10 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "backward_extension_seconds": 0.0,
         "is_walking": True,
         "start_offset_seconds": 0.0,
+        "capture_images": True,
+        "capture_images_mode": "coming",
+        "capture_images_min": 1,
+        "capture_images_max": 5,
     },
     4: {
         "direction": "kitting",
@@ -251,6 +263,10 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "end_trim_seconds": 0.0,
         "backward_extension_seconds": 0.0,
         "start_offset_seconds": 0.0,
+        "capture_images": True,
+        "capture_images_mode": "coming",
+        "capture_images_min": 1,
+        "capture_images_max": 5,
     },
     5: {
         "direction": "sitting",
@@ -260,6 +276,10 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "end_trim_seconds": 0.0,
         "backward_extension_seconds": 0.0,
         "start_offset_seconds": 0.0,
+        "capture_images": True,
+        "capture_images_mode": "group",
+        "capture_images_min": 1,
+        "capture_images_max": 5,
     },
 }
 
@@ -279,7 +299,7 @@ def detect_zipline_segment(
     trim_output_path: Optional[str] = None,
     is_walking: bool = False,
     start_offset_seconds: Optional[float] = None,
-    capture_images: bool = False,
+    capture_images: Optional[bool] = None,
     capture_images_mode: Optional[str] = None,
     capture_images_min: Optional[int] = None,
     capture_images_max: Optional[int] = None,
@@ -328,6 +348,12 @@ def detect_zipline_segment(
             - Example: detected start = 7s, offset = 2s ⇒ final start = 5s (clamped to >= 0)
             - Ignored when <= 0 or when start is already near 0
             - If platform_number is provided and this is None, uses the platform's configured start_offset_seconds
+        capture_images: Optional bool to enable image capture within the detected window
+            - If None, defers to the platform configuration (default False)
+        capture_images_mode: Optional capture mode override ("going", "coming", "group")
+            - If None, uses platform configuration, then falls back to detection direction
+        capture_images_min / capture_images_max: Optional overrides for number of images to capture
+            - If None, use platform configuration when available
 
     Returns:
         dict with:
@@ -440,6 +466,14 @@ def detect_zipline_segment(
             is_walking = True
         if start_offset_seconds is None:
             start_offset_seconds = platform_config.get("start_offset_seconds", 0.0)
+        if capture_images is None:
+            capture_images = platform_config.get("capture_images")
+        if capture_images_mode is None:
+            capture_images_mode = platform_config.get("capture_images_mode")
+        if capture_images_min is None:
+            capture_images_min = platform_config.get("capture_images_min")
+        if capture_images_max is None:
+            capture_images_max = platform_config.get("capture_images_max")
     else:
         # Use defaults if no platform and no explicit values
         if direction is None:
@@ -457,6 +491,10 @@ def detect_zipline_segment(
 
     if start_offset_seconds is None or start_offset_seconds < 0:
         start_offset_seconds = 0.0
+    if capture_images is None:
+        capture_images = False
+    else:
+        capture_images = bool(capture_images)
 
     if is_walking:
         direction = "walking"
@@ -2372,10 +2410,6 @@ if __name__ == "__main__":
         input_video_path="vid28.MP4",
         platform_number=5,
         show_frames=True,
-        capture_images=True,
-        capture_images_min=1,
-        capture_images_max=5,
-        capture_images_mode="group",
     )
 
     import json
