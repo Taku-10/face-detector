@@ -7,8 +7,9 @@ returning the start and end timestamps for that segment.
 
 import cv2
 import mediapipe as mp
-from typing import Optional, Dict, Any, Sequence
+from typing import Optional, Dict, Any, List, Sequence
 import os
+from pathlib import Path
 
 # Import image capture functionality
 try:
@@ -30,6 +31,8 @@ def _add_image_capture_to_result(
     direction: str,
     show_progress: bool,
     show_frames: bool,
+    capture_offset_after_start: Optional[float],
+    capture_offset_before_end: Optional[float],
 ) -> dict:
     """Helper function to add image capture results to detection result."""
     if (
@@ -64,9 +67,116 @@ def _add_image_capture_to_result(
             show_progress=show_progress,
             show_frames=show_frames,
         )
+        additional_captures = _capture_specific_offsets(
+            input_video_path,
+            segment_start_time,
+            segment_end_time,
+            capture_offset_after_start,
+            capture_offset_before_end,
+            capture_result.get("output_dir")
+            if isinstance(capture_result, dict)
+            else None,
+        )
+        if additional_captures:
+            if isinstance(capture_result, dict):
+                capture_result.setdefault("extra_captures", []).extend(
+                    additional_captures
+                )
+            else:
+                capture_result = {
+                    "success": True,
+                    "captured_files": [],
+                    "images_captured": 0,
+                    "candidates_found": 0,
+                    "output_dir": os.path.join(
+                        os.path.dirname(os.path.abspath(input_video_path)),
+                        f"{Path(input_video_path).stem}-images",
+                    ),
+                    "mode": capture_mode,
+                    "extra_captures": additional_captures,
+                }
         result["image_capture"] = capture_result
 
     return result
+
+
+def _capture_specific_offsets(
+    video_path: str,
+    segment_start_time: Optional[float],
+    segment_end_time: Optional[float],
+    offset_after_start: Optional[float],
+    offset_before_end: Optional[float],
+    base_output_dir: Optional[str],
+) -> List[str]:
+    if segment_start_time is None or segment_end_time is None:
+        return []
+
+    safe_after = (
+        offset_after_start if offset_after_start and offset_after_start > 0 else None
+    )
+    safe_before = (
+        offset_before_end if offset_before_end and offset_before_end > 0 else None
+    )
+
+    if safe_after is None and safe_before is None:
+        return []
+
+    output_dir = (
+        base_output_dir
+        if base_output_dir
+        else os.path.join(
+            os.path.dirname(os.path.abspath(video_path)),
+            f"{Path(video_path).stem}-images",
+        )
+    )
+    os.makedirs(output_dir, exist_ok=True)
+
+    captured_files: List[str] = []
+    if safe_after is not None:
+        target_time = segment_start_time + safe_after
+        if target_time < segment_end_time:
+            captured = _capture_frame_at_time(
+                video_path, target_time, output_dir, f"after_start_{safe_after:.2f}"
+            )
+            if captured:
+                captured_files.append(captured)
+
+    if safe_before is not None:
+        target_time = segment_end_time - safe_before
+        if target_time > segment_start_time:
+            captured = _capture_frame_at_time(
+                video_path, target_time, output_dir, f"before_end_{safe_before:.2f}"
+            )
+            if captured:
+                captured_files.append(captured)
+
+    return captured_files
+
+
+def _capture_frame_at_time(
+    video_path: str,
+    time_seconds: float,
+    output_dir: str,
+    label: str,
+) -> Optional[str]:
+    if time_seconds < 0:
+        return None
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+
+    cap.set(cv2.CAP_PROP_POS_MSEC, time_seconds * 1000.0)
+    ret, frame = cap.read()
+    cap.release()
+
+    if not ret or frame is None:
+        return None
+
+    filename = f"extra_{label}_t{time_seconds:.2f}s.jpg"
+    filepath = os.path.join(output_dir, filename)
+    cv2.imwrite(filepath, frame)
+    return filepath
 
 
 def is_valid_face_detection(
@@ -227,6 +337,8 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "capture_images_mode": "going",
         "capture_images_min": 1,
         "capture_images_max": 5,
+        "capture_offset_after_start": 2.5,
+        "capture_offset_before_end": 1.0,
     },
     2: {
         "direction": "coming",
@@ -240,6 +352,8 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "capture_images_mode": "coming",
         "capture_images_min": 1,
         "capture_images_max": 5,
+        "capture_offset_after_start": 2.5,
+        "capture_offset_before_end": 2.0,
     },
     3: {
         "direction": "walking",
@@ -250,10 +364,12 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "backward_extension_seconds": 0.0,
         "is_walking": True,
         "start_offset_seconds": 0.0,
-        "capture_images": True,
-        "capture_images_mode": "coming",
+        "capture_images": False,
+        "capture_images_mode": "group",
         "capture_images_min": 1,
         "capture_images_max": 5,
+        "capture_offset_after_start": None,
+        "capture_offset_before_end": None,
     },
     4: {
         "direction": "kitting",
@@ -263,10 +379,12 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "end_trim_seconds": 0.0,
         "backward_extension_seconds": 0.0,
         "start_offset_seconds": 0.0,
-        "capture_images": True,
-        "capture_images_mode": "coming",
+        "capture_images": False,
+        "capture_images_mode": "group",
         "capture_images_min": 1,
         "capture_images_max": 5,
+        "capture_offset_after_start": None,
+        "capture_offset_before_end": None,
     },
     5: {
         "direction": "sitting",
@@ -276,10 +394,12 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "end_trim_seconds": 0.0,
         "backward_extension_seconds": 0.0,
         "start_offset_seconds": 0.0,
-        "capture_images": True,
+        "capture_images": False,
         "capture_images_mode": "group",
         "capture_images_min": 1,
         "capture_images_max": 5,
+        "capture_offset_after_start": None,
+        "capture_offset_before_end": None,
     },
 }
 
@@ -303,6 +423,8 @@ def detect_zipline_segment(
     capture_images_mode: Optional[str] = None,
     capture_images_min: Optional[int] = None,
     capture_images_max: Optional[int] = None,
+    capture_offset_after_start: Optional[float] = None,
+    capture_offset_before_end: Optional[float] = None,
 ) -> dict:
     """
     Detects the visible time range of a zipline rider in the video.
@@ -354,6 +476,10 @@ def detect_zipline_segment(
             - If None, uses platform configuration, then falls back to detection direction
         capture_images_min / capture_images_max: Optional overrides for number of images to capture
             - If None, use platform configuration when available
+        capture_offset_after_start: Optional number of seconds after the detected start
+            where an additional frame should be forcibly captured (e.g., 2.0)
+        capture_offset_before_end: Optional number of seconds before the detected end
+            where another frame should be captured
 
     Returns:
         dict with:
@@ -474,6 +600,12 @@ def detect_zipline_segment(
             capture_images_min = platform_config.get("capture_images_min")
         if capture_images_max is None:
             capture_images_max = platform_config.get("capture_images_max")
+        if capture_offset_after_start is None:
+            capture_offset_after_start = platform_config.get(
+                "capture_offset_after_start"
+            )
+        if capture_offset_before_end is None:
+            capture_offset_before_end = platform_config.get("capture_offset_before_end")
     else:
         # Use defaults if no platform and no explicit values
         if direction is None:
@@ -495,6 +627,16 @@ def detect_zipline_segment(
         capture_images = False
     else:
         capture_images = bool(capture_images)
+    capture_offset_after_start = (
+        float(capture_offset_after_start)
+        if capture_offset_after_start is not None
+        else None
+    )
+    capture_offset_before_end = (
+        float(capture_offset_before_end)
+        if capture_offset_before_end is not None
+        else None
+    )
 
     if is_walking:
         direction = "walking"
@@ -1012,6 +1154,8 @@ def detect_zipline_segment(
                     direction,
                     show_progress,
                     show_frames,
+                    capture_offset_after_start,
+                    capture_offset_before_end,
                 )
 
                 return result
@@ -1303,6 +1447,8 @@ def detect_zipline_segment(
                 direction,
                 show_progress,
                 show_frames,
+                capture_offset_after_start,
+                capture_offset_before_end,
             )
 
             return result
@@ -1751,6 +1897,8 @@ def detect_zipline_segment(
                     direction,
                     show_progress,
                     show_frames,
+                    capture_offset_after_start,
+                    capture_offset_before_end,
                 )
 
                 return result
@@ -2010,6 +2158,8 @@ def detect_zipline_segment(
                     direction,
                     show_progress,
                     show_frames,
+                    capture_offset_after_start,
+                    capture_offset_before_end,
                 )
 
                 return result
@@ -2379,6 +2529,8 @@ def detect_zipline_segment(
                     direction,
                     show_progress,
                     show_frames,
+                    capture_offset_after_start,
+                    capture_offset_before_end,
                 )
 
                 return result
@@ -2407,8 +2559,8 @@ def detect_zipline_segment(
 
 if __name__ == "__main__":
     result = detect_zipline_segment(
-        input_video_path="vid28.MP4",
-        platform_number=5,
+        input_video_path="going-1.MP4",
+        platform_number=1,
         show_frames=True,
     )
 
