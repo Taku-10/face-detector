@@ -10,6 +10,64 @@ import mediapipe as mp
 from typing import Optional, Dict, Any, Sequence
 import os
 
+# Import image capture functionality
+try:
+    from capture_images import capture_images_from_video
+except ImportError:
+    capture_images_from_video = None
+
+
+def _add_image_capture_to_result(
+    result: dict,
+    input_video_path: str,
+    segment_start_time: Optional[float],
+    segment_end_time: Optional[float],
+    capture_images: bool,
+    capture_images_mode: Optional[str],
+    capture_images_min: Optional[int],
+    capture_images_max: Optional[int],
+    platform_number: Optional[int],
+    direction: str,
+    show_progress: bool,
+    show_frames: bool,
+) -> dict:
+    """Helper function to add image capture results to detection result."""
+    if (
+        capture_images
+        and result.get("valid", False)
+        and segment_start_time is not None
+        and segment_end_time is not None
+        and capture_images_from_video is not None
+    ):
+        # Determine capture mode
+        capture_mode = capture_images_mode
+        if capture_mode is None:
+            # Map direction to capture mode
+            if direction == "coming":
+                capture_mode = "coming"
+            elif direction == "going":
+                capture_mode = "going"
+            elif direction in ["walking", "kitting", "sitting"]:
+                capture_mode = "group"
+            else:
+                capture_mode = "going"  # Default
+
+        # Capture images from the detected segment
+        capture_result = capture_images_from_video(
+            video_path=input_video_path,
+            mode=capture_mode,
+            min_pictures=capture_images_min,
+            max_pictures=capture_images_max,
+            platform_number=platform_number,
+            start_time=segment_start_time,
+            end_time=segment_end_time,
+            show_progress=show_progress,
+            show_frames=show_frames,
+        )
+        result["image_capture"] = capture_result
+
+    return result
+
 
 def is_valid_face_detection(
     bbox,
@@ -176,15 +234,6 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "start_offset_seconds": 0.0,
     },
     3: {
-        "direction": "coming",
-        "min_duration": 3.0,
-        "max_duration": 6.0,
-        "ideal_duration": 5.0,
-        "end_trim_seconds": 1.0,
-        "backward_extension_seconds": 2.0,
-        "start_offset_seconds": 0.0,
-    },
-    4: {
         "direction": "walking",
         "min_duration": 3.0,
         "max_duration": 10.0,
@@ -194,17 +243,7 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "is_walking": True,
         "start_offset_seconds": 0.0,
     },
-    5: {
-        "direction": "walking",
-        "min_duration": 12.0,
-        "max_duration": 20.0,
-        "ideal_duration": 10.0,
-        "end_trim_seconds": 0.0,
-        "backward_extension_seconds": 0.0,
-        "is_walking": True,
-        "start_offset_seconds": 0.0,
-    },
-    6: {
+    4: {
         "direction": "kitting",
         "min_duration": 20.0,
         "max_duration": 60.0,
@@ -213,7 +252,7 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "backward_extension_seconds": 0.0,
         "start_offset_seconds": 0.0,
     },
-    7: {
+    5: {
         "direction": "sitting",
         "min_duration": 25.0,
         "max_duration": 60.0,
@@ -235,10 +274,15 @@ def detect_zipline_segment(
     backward_extension_seconds: Optional[float] = None,
     platform_number: Optional[int] = None,
     show_frames: bool = False,
+    show_progress: bool = False,
     output_video_path: Optional[str] = None,
     trim_output_path: Optional[str] = None,
     is_walking: bool = False,
     start_offset_seconds: Optional[float] = None,
+    capture_images: bool = False,
+    capture_images_mode: Optional[str] = None,
+    capture_images_min: Optional[int] = None,
+    capture_images_max: Optional[int] = None,
 ) -> dict:
     """
     Detects the visible time range of a zipline rider in the video.
@@ -272,6 +316,7 @@ def detect_zipline_segment(
             - Platform configs are defined in PLATFORM_CONFIGS dictionary
             - Individual parameters can still override platform settings if explicitly provided
         show_frames: If True, displays frames with detection overlay in real-time (default: False)
+        show_progress: If True, displays progress information during processing (default: False)
         output_video_path: Optional path to save video with detection overlay (default: None)
         trim_output_path: Optional path to save trimmed video segment (default: None)
         is_walking: If True, forces walking detection logic regardless of direction/platform
@@ -915,6 +960,22 @@ def detect_zipline_segment(
                     else:
                         result["trim_warning"] = "Failed to create trimmed video"
 
+                # Add image capture if requested
+                result = _add_image_capture_to_result(
+                    result,
+                    input_video_path,
+                    segment_start_time,
+                    segment_end_time,
+                    capture_images,
+                    capture_images_mode,
+                    capture_images_min,
+                    capture_images_max,
+                    platform_number,
+                    direction,
+                    show_progress,
+                    show_frames,
+                )
+
                 return result
             else:
                 result = {
@@ -1189,6 +1250,22 @@ def detect_zipline_segment(
                     result["trimmed_video"] = trim_output_path
                 else:
                     result["trim_warning"] = "Failed to create trimmed video"
+
+            # Add image capture if requested
+            result = _add_image_capture_to_result(
+                result,
+                input_video_path,
+                segment_start_time,
+                segment_end_time,
+                capture_images,
+                capture_images_mode,
+                capture_images_min,
+                capture_images_max,
+                platform_number,
+                direction,
+                show_progress,
+                show_frames,
+            )
 
             return result
         elif direction == "kitting":
@@ -1622,6 +1699,22 @@ def detect_zipline_segment(
                     else:
                         result["trim_warning"] = "Failed to create trimmed video"
 
+                # Add image capture if requested
+                result = _add_image_capture_to_result(
+                    result,
+                    input_video_path,
+                    segment_start_time,
+                    segment_end_time,
+                    capture_images,
+                    capture_images_mode,
+                    capture_images_min,
+                    capture_images_max,
+                    platform_number,
+                    direction,
+                    show_progress,
+                    show_frames,
+                )
+
                 return result
             else:
                 result = {
@@ -1864,6 +1957,22 @@ def detect_zipline_segment(
                         result["trimmed_video"] = trim_output_path
                     else:
                         result["trim_warning"] = "Failed to create trimmed video"
+
+                # Add image capture if requested
+                result = _add_image_capture_to_result(
+                    result,
+                    input_video_path,
+                    segment_start_time,
+                    segment_end_time,
+                    capture_images,
+                    capture_images_mode,
+                    capture_images_min,
+                    capture_images_max,
+                    platform_number,
+                    direction,
+                    show_progress,
+                    show_frames,
+                )
 
                 return result
             else:
@@ -2218,6 +2327,22 @@ def detect_zipline_segment(
                     else:
                         result["trim_warning"] = "Failed to create trimmed video"
 
+                # Add image capture if requested
+                result = _add_image_capture_to_result(
+                    result,
+                    input_video_path,
+                    segment_start_time,
+                    segment_end_time,
+                    capture_images,
+                    capture_images_mode,
+                    capture_images_min,
+                    capture_images_max,
+                    platform_number,
+                    direction,
+                    show_progress,
+                    show_frames,
+                )
+
                 return result
             else:
                 result = {
@@ -2244,9 +2369,13 @@ def detect_zipline_segment(
 
 if __name__ == "__main__":
     result = detect_zipline_segment(
-        input_video_path="tcoming-1.MP4",
-        platform_number=2,
+        input_video_path="vid28.MP4",
+        platform_number=5,
         show_frames=True,
+        capture_images=True,
+        capture_images_min=1,
+        capture_images_max=5,
+        capture_images_mode="group",
     )
 
     import json

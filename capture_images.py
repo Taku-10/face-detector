@@ -13,55 +13,8 @@ import os
 from typing import List, Dict, Tuple, Optional, Any
 from pathlib import Path
 
-# Platform-specific configurations
-PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
-    1: {
-        "mode": "going",
-        "min_pictures": 1,
-        "max_pictures": 10,
-    },
-    2: {
-        "mode": "coming",
-        "min_pictures": 1,
-        "max_pictures": 8,
-        "guide_region_width_ratio": 0.4,
-        "guide_region_height_ratio": 0.8,
-    },
-    3: {
-        "mode": "coming",
-        "min_pictures": 3,
-        "max_pictures": 6,
-        "guide_region_width_ratio": 0.4,
-        "guide_region_height_ratio": 0.8,
-    },
-    4: {
-        "mode": "going",
-        "min_pictures": 5,
-        "max_pictures": 12,
-    },
-    5: {
-        "mode": "coming",
-        "min_pictures": 4,
-        "max_pictures": 10,
-        "guide_region_width_ratio": 0.4,
-        "guide_region_height_ratio": 0.8,
-    },
-    6: {
-        "mode": "going",
-        "min_pictures": 6,
-        "max_pictures": 15,
-    },
-    7: {
-        "mode": "coming",
-        "min_pictures": 5,
-        "max_pictures": 12,
-        "guide_region_width_ratio": 0.4,
-        "guide_region_height_ratio": 0.8,
-    },
-}
-
-DEFAULT_GUIDE_REGION_WIDTH_RATIO = 0.25
-DEFAULT_GUIDE_REGION_HEIGHT_RATIO = 0.25
+DEFAULT_GUIDE_REGION_WIDTH_RATIO = 0.4
+DEFAULT_GUIDE_REGION_HEIGHT_RATIO = 0.8
 
 
 def calculate_sharpness(frame: np.ndarray) -> float:
@@ -368,25 +321,22 @@ def capture_images_from_video(
     sharpness_threshold: float = 100.0,
     show_progress: bool = False,
     show_frames: bool = False,
+    start_time: Optional[float] = None,
+    end_time: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Capture images from video based on specified mode and criteria.
 
     Args:
         video_path: Path to input video file
-        mode: Detection mode ("going" or "coming")
-            - If None and platform_number is provided, uses platform's mode
-            - If None and platform_number is not provided, defaults to "going"
-        min_pictures: Minimum number of pictures to capture
-            - If None and platform_number is provided, uses platform's min_pictures
-            - If None and platform_number is not provided, defaults to 5
-        max_pictures: Maximum number of pictures to capture
-            - If None and platform_number is provided, uses platform's max_pictures
-            - If None and platform_number is not provided, defaults to 10
-        platform_number: Platform number (1, 2, 3, etc.) to use platform-specific settings
-            - If provided, overrides mode, min_pictures, max_pictures with platform config
-            - Platform configs are defined in PLATFORM_CONFIGS dictionary
-            - Individual parameters can still override platform settings if explicitly provided
+        mode: Detection mode ("going", "coming", or "group")
+            - "going": Face detection with smile detection and ranking
+            - "coming": Person detection filtering out guide in bottom left corner
+            - "group": Detects multiple faces and captures frames with most faces visible
+            - If None, defaults to "going"
+        min_pictures: Minimum number of pictures to capture (defaults to 5 if None)
+        max_pictures: Maximum number of pictures to capture (defaults to 10 if None)
+        platform_number: Optional identifier carried through to the result (no longer alters behavior)
         output_dir: Output directory for images
             - If None, automatically generates: {video_name}-images in same directory as video
             - Example: "vid1.mp4" -> "vid1-images/"
@@ -394,51 +344,31 @@ def capture_images_from_video(
         show_progress: If True, display progress information
         show_frames: If True, displays frames with detection overlay in real-time
             - For "coming" mode, guide-region overlay uses configured width/height ratios
+        start_time: Optional start time in seconds to limit processing to a specific segment
+            - If provided, only processes frames from start_time onwards
+        end_time: Optional end time in seconds to limit processing to a specific segment
+            - If provided, only processes frames up to end_time
+            - If both start_time and end_time are provided, only processes that time range
 
     Returns:
         Dictionary with capture results (Any type for flexibility)
     """
     guide_region_width_ratio = DEFAULT_GUIDE_REGION_WIDTH_RATIO
     guide_region_height_ratio = DEFAULT_GUIDE_REGION_HEIGHT_RATIO
-    # Apply platform-specific configuration if platform_number is provided
-    if platform_number is not None:
-        if platform_number not in PLATFORM_CONFIGS:
-            return {
-                "success": False,
-                "error": f"Platform {platform_number} not found in PLATFORM_CONFIGS. "
-                f"Available platforms: {list(PLATFORM_CONFIGS.keys())}",
-                "platform_number": platform_number,
-            }
 
-        platform_config = PLATFORM_CONFIGS[platform_number]
-
-        # Use platform config values if individual parameters are not provided
-        if mode is None:
-            mode = platform_config.get("mode", "going")
-        if min_pictures is None:
-            min_pictures = platform_config.get("min_pictures", 5)
-        if max_pictures is None:
-            max_pictures = platform_config.get("max_pictures", 10)
-        guide_region_width_ratio = platform_config.get(
-            "guide_region_width_ratio", guide_region_width_ratio
-        )
-        guide_region_height_ratio = platform_config.get(
-            "guide_region_height_ratio", guide_region_height_ratio
-        )
-    else:
-        # Use defaults if no platform and no explicit values
-        if mode is None:
-            mode = "going"
-        if min_pictures is None:
-            min_pictures = 5
-        if max_pictures is None:
-            max_pictures = 10
+    # Apply defaults if unspecified
+    if mode is None:
+        mode = "going"
+    if min_pictures is None:
+        min_pictures = 5
+    if max_pictures is None:
+        max_pictures = 10
 
     # Validate mode
-    if mode not in ["going", "coming"]:
+    if mode not in ["going", "coming", "group"]:
         return {
             "success": False,
-            "error": f"Invalid mode: {mode}. Must be 'going' or 'coming'",
+            "error": f"Invalid mode: {mode}. Must be 'going', 'coming', or 'group'",
         }
 
     # Validate video file
@@ -462,6 +392,7 @@ def capture_images_from_video(
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    video_duration = total_frames / fps if fps > 0 else 0.0
     guide_region_width_px = int(frame_width * guide_region_width_ratio)
     guide_region_height_px = int(frame_height * guide_region_height_ratio)
     guide_region_y_start_px = frame_height - guide_region_height_px
@@ -484,9 +415,9 @@ def capture_images_from_video(
         min_tracking_confidence=0.5,
     )
 
-    # Initialize background subtractor for person detection (coming mode)
+    # Initialize background subtractor for person detection (coming and group modes)
     bg_subtractor = None
-    if mode == "coming":
+    if mode == "coming" or mode == "group":
         bg_subtractor = cv2.createBackgroundSubtractorMOG2(
             history=500, varThreshold=50, detectShadows=True
         )
@@ -499,11 +430,28 @@ def capture_images_from_video(
 
     frame_count = 0
     images_captured = 0
+    last_detection_info = None  # Ensure defined before processing loop
+
+    # Calculate frame range if start_time/end_time are provided
+    start_frame = None
+    end_frame = None
+    if start_time is not None:
+        start_frame = int(start_time * fps)
+    if end_time is not None:
+        end_frame = int(end_time * fps)
+
+    # Seek to start frame if specified
+    if start_frame is not None and start_frame > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        frame_count = start_frame
 
     if show_progress:
         print(f"Processing video: {video_path}")
         print(f"Mode: {mode}")
         print(f"Target: {min_pictures}-{max_pictures} images")
+        if start_time is not None or end_time is not None:
+            time_range = f"Time range: {start_time or 0:.2f}s - {end_time or video_duration:.2f}s"
+            print(time_range)
         print(f"Processing {total_frames} frames...")
 
     # Process video frames
@@ -513,6 +461,15 @@ def capture_images_from_video(
             break
 
         frame_time = frame_count / fps
+
+        # Skip if before start_time
+        if start_time is not None and frame_time < start_time:
+            frame_count += 1
+            continue
+
+        # Stop if past end_time
+        if end_time is not None and frame_time > end_time:
+            break
 
         # Sample frames for efficiency
         if frame_count % sample_interval == 0:
@@ -726,6 +683,146 @@ def capture_images_from_video(
                                 "rejected": None,
                             }
 
+            elif mode == "group":
+                # GROUP MODE: Detect both people (person detection) and faces
+                # Count total people/faces to capture frames with most people visible
+
+                # 1. Detect people using background subtraction
+                person_count = 0
+                person_bboxes = []
+
+                if bg_subtractor is not None:
+                    fg_mask = bg_subtractor.apply(frame)
+
+                    # Morphological operations to reduce noise
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
+                    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+
+                    # Find contours
+                    contours, _ = cv2.findContours(
+                        fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                    )
+
+                    if contours:
+                        # Filter contours by area to find people
+                        min_area = (frame_width * frame_height) * 0.02  # 2% of frame
+                        for contour in contours:
+                            area = cv2.contourArea(contour)
+                            if area >= min_area:
+                                x, y, w, h = cv2.boundingRect(contour)
+                                person_bboxes.append((x, y, w, h))
+                                person_count += 1
+
+                # 2. Detect faces
+                face_results = face_detection.process(rgb_frame)
+                face_count = 0
+                face_bboxes = []
+                valid_faces = []
+
+                if face_results.detections:
+                    for det in face_results.detections:
+                        bbox = det.location_data.relative_bounding_box
+                        confidence = det.score[0]
+
+                        # Convert to pixel coordinates
+                        x = int(bbox.xmin * frame_width)
+                        y = int(bbox.ymin * frame_height)
+                        w = int(bbox.width * frame_width)
+                        h = int(bbox.height * frame_height)
+
+                        # Ensure within bounds
+                        x = max(0, x)
+                        y = max(0, y)
+                        w = min(w, frame_width - x)
+                        h = min(h, frame_height - y)
+
+                        # Check if face is large enough (at least 3% of frame width for groups)
+                        min_face_width = int(frame_width * 0.03)
+                        if (
+                            w >= min_face_width
+                            and h >= min_face_width
+                            and confidence >= 0.5
+                        ):
+                            valid_faces.append(
+                                {
+                                    "bbox": (x, y, w, h),
+                                    "confidence": confidence,
+                                }
+                            )
+                            face_bboxes.append((x, y, w, h))
+                            face_count += 1
+
+                # 3. Count total people/faces (use maximum of person_count and face_count, or sum)
+                # We'll use the maximum to avoid double-counting, but prefer faces when available
+                total_count_int = max(person_count, face_count)
+                total_count = float(total_count_int)
+
+                # If we have both person and face detections, we can be more confident
+                # So we add a small bonus if both detection methods agree
+                if person_count > 0 and face_count > 0:
+                    # Use the higher count, but add a small bonus for agreement
+                    total_count = float(max(person_count, face_count)) + 0.5
+
+                # Only consider frames with at least 2 people/faces (group requirement)
+                if total_count >= 2:
+                    # Calculate score: primarily based on total count
+                    # More people/faces = higher score
+                    count_score = total_count * 0.4  # 0.4 per person/face
+
+                    # Average confidence of faces (if any)
+                    avg_confidence = 0.0
+                    if len(valid_faces) > 0:
+                        avg_confidence = sum(
+                            f["confidence"] for f in valid_faces
+                        ) / len(valid_faces)
+                    confidence_score = avg_confidence * 0.2
+
+                    # Sharpness component
+                    sharpness_score_component = (sharpness_score / 500.0) * 0.2
+
+                    # Bonus for having both person and face detections
+                    detection_method_bonus = (
+                        0.2 if (person_count > 0 and face_count > 0) else 0.0
+                    )
+
+                    total_score = (
+                        count_score
+                        + confidence_score
+                        + sharpness_score_component
+                        + detection_method_bonus
+                    )
+
+                    candidate_frames.append(
+                        {
+                            "frame": frame.copy(),
+                            "frame_count": frame_count,
+                            "time": frame_time,
+                            "score": total_score,
+                            "person_count": person_count,
+                            "face_count": face_count,
+                            "total_count": total_count,
+                            "avg_confidence": avg_confidence,
+                            "sharpness": sharpness_score,
+                            "person_bboxes": person_bboxes,
+                            "face_bboxes": face_bboxes,
+                        }
+                    )
+
+                    # Store detection info for visualization
+                    last_detection_info = {
+                        "person_count": person_count,
+                        "face_count": face_count,
+                        "total_count": total_count,
+                        "person_bboxes": person_bboxes,
+                        "face_bboxes": face_bboxes,
+                        "avg_confidence": avg_confidence,
+                        "sharpness": sharpness_score,
+                        "score": total_score,
+                    }
+                else:
+                    last_detection_info = None
+
         # Create display frame with overlays if needed
         if show_frames:
             display_frame = frame.copy()
@@ -879,6 +976,76 @@ def capture_images_from_video(
                         2,
                     )
 
+            elif mode == "group":
+                # Draw all detected people and faces
+                if last_detection_info:
+                    person_count = last_detection_info["person_count"]
+                    face_count = last_detection_info["face_count"]
+                    total_count = last_detection_info["total_count"]
+                    person_bboxes = last_detection_info["person_bboxes"]
+                    face_bboxes = last_detection_info["face_bboxes"]
+                    avg_confidence = last_detection_info["avg_confidence"]
+                    sharpness = last_detection_info["sharpness"]
+                    score = last_detection_info["score"]
+
+                    # Draw bounding boxes for all people (orange)
+                    for i, (x, y, w, h) in enumerate(person_bboxes):
+                        color = (0, 165, 255)  # Orange for people
+                        cv2.rectangle(display_frame, (x, y), (x + w, y + h), color, 2)
+                        cv2.putText(
+                            display_frame,
+                            f"Person {i + 1}",
+                            (x, y - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            color,
+                            2,
+                        )
+
+                    # Draw bounding boxes for all faces (green)
+                    for i, (x, y, w, h) in enumerate(face_bboxes):
+                        color = (0, 255, 0)  # Green for faces
+                        cv2.rectangle(display_frame, (x, y), (x + w, y + h), color, 2)
+                        cv2.putText(
+                            display_frame,
+                            f"Face {i + 1}",
+                            (x, y - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            color,
+                            2,
+                        )
+
+                    # Add info overlay
+                    info_text = [
+                        f"Time: {frame_time:.2f}s | Frame: {frame_count}",
+                        f"Mode: {mode} | Candidates: {len(candidate_frames)}",
+                        f"People: {person_count} | Faces: {face_count} | Total: {total_count:.1f}",
+                        f"Avg Confidence: {avg_confidence:.2f} | Sharpness: {sharpness:.1f}",
+                        f"Score: {score:.3f} | Status: ACCEPTED",
+                    ]
+                    for i, text in enumerate(info_text):
+                        cv2.putText(
+                            display_frame,
+                            text,
+                            (10, 30 + i * 25),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            (255, 255, 255),
+                            2,
+                        )
+                else:
+                    # No detection or less than 2 people/faces
+                    cv2.putText(
+                        display_frame,
+                        f"Time: {frame_time:.2f}s | Searching for groups (min 2 people/faces)...",
+                        (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 0, 255),
+                        2,
+                    )
+
             # Show frame
             cv2.imshow("Image Capture - Detection", display_frame)
             if cv2.waitKey(30) & 0xFF == ord("q"):
@@ -959,8 +1126,8 @@ def capture_images_from_video(
 if __name__ == "__main__":
     # Example usage - modify video_path and platform_number as needed
     result = capture_images_from_video(
-        video_path="vid28.MP4",  # Change to your video path
-        platform_number=1,  # Change to your platform number
+        video_path="vid24.MP4",  # Change to your video path
+        platform_number=3,  # Change to your platform number
         show_frames=True,  # Set to True to see real-time detection
         show_progress=True,  # Set to True to see progress messages
     )
