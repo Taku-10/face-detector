@@ -11,96 +11,125 @@ This document explains the detection logic, start/end time determination, and du
 - **`min_duration`**: Minimum duration for a valid clip (default: 4.0 seconds)
 - **`max_duration`**: Maximum duration cap (optional, can be `None`)
 - **`ideal_duration`**: Ideal duration for clips (default: 8.0 seconds)
-  - Used for both "coming" and "going" videos to select the best detection
-  - For "coming": Picks motion detection that creates clip closest to ideal_duration
-  - For "going": Picks face detection that creates clip closest to ideal_duration
-  - Ensures clips are close to the desired length when possible
-- **`direction`**: Either "coming" or "going" (direction of rider)
-- **`end_trim_seconds`**: Seconds to remove from end for "coming" videos when end reaches video end (default: 1.0)
-  - Only applies to "coming" videos when `(start_time + ideal_duration) >= video_duration`
-  - Used to crop out guide's hand switching off camera
-  - Can be configured per platform or as a direct parameter
-- **`backward_extension_seconds`**: Seconds to extend backward (earlier) when duration is too short (default: 2.0)
-  - For "coming" videos: Used first when `duration < min_duration` (extends start time earlier)
-  - For "going" videos: Used as fallback when forward extension fails (extends start time earlier)
-  - Can be configured per platform or as a direct parameter
-- **`platform_number`**: Platform number (1, 2, 3, etc.) to use platform-specific settings
-  - If provided, automatically applies platform's direction, min_duration, max_duration, ideal_duration, end_trim_seconds, and backward_extension_seconds
-  - Individual parameters can still override platform settings if explicitly provided
+  - Used by every mode; we still select detections that get closest to this target
+- **`direction`**: `"coming"`, `"going"`, `"walking"`, `"kitting"`, or `"sitting"`
+- **`end_trim_seconds`**: Seconds to remove from the tail when the clip touches video end (mainly for "coming")
+- **`backward_extension_seconds`**: How far we’re allowed to rewind the start if a clip is too short
+- **`start_offset_seconds`**: Optional negative offset applied after detection (mostly used for walking/kitting)
+- **`platform_number`**: Applies a bundled configuration so the caller rarely needs to pass individual overrides
+
+### Image Capture Parameters
+
+Every detection run can optionally trigger still-image capture through `capture_images_from_video`:
+
+- **`capture_images`**: Enable/disable capture for this run. Defaults come from the platform entry.
+- **`capture_images_mode`**: `"going"`, `"coming"`, or `"group"` detection mode for the capture pipeline.
+- **`capture_images_min` / `capture_images_max`**: Hard bounds for how many frames should be exported.
+- **`capture_offset_after_start`**: Seconds after the detected start where we *force* an extra frame grab of the rider on the zipline.
+- **`capture_offset_before_end`**: Seconds before the detected end where we capture another contextual frame.
+
+If a parameter is omitted we fall back to the selected platform's defaults; explicit arguments always win.
 
 ### Platform Configuration
 
-Each platform can have its own customized settings defined in `PLATFORM_CONFIGS`:
+Each platform entry now bundles *both* detection timing and capture preferences:
 
 ```python
-PLATFORM_CONFIGS = {
+PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
     1: {
         "direction": "going",
         "min_duration": 5.0,
         "max_duration": 10.0,
         "ideal_duration": 8.0,
-        "end_trim_seconds": 0.0,  # Seconds to remove from end for "coming" videos
-        "backward_extension_seconds": 2.0,  # Seconds to extend backward when duration is too short
+        "end_trim_seconds": 0.0,
+        "backward_extension_seconds": 2.0,
+        "start_offset_seconds": 0.0,
+        "capture_images": True,
+        "capture_images_mode": "going",
+        "capture_images_min": 1,
+        "capture_images_max": 5,
+        "capture_offset_after_start": 2.0,   # Rider still on zipline
+        "capture_offset_before_end": 2.0,    # Context before landing
     },
     2: {
         "direction": "coming",
         "min_duration": 5.0,
         "max_duration": 10.0,
         "ideal_duration": 8.0,
-        "end_trim_seconds": 1.0,  # Seconds to remove from end for "coming" videos
-        "backward_extension_seconds": 2.0,  # Seconds to extend backward when duration is too short
+        "end_trim_seconds": 1.0,
+        "backward_extension_seconds": 2.0,
+        "start_offset_seconds": 0.0,
+        "capture_images": True,
+        "capture_images_mode": "coming",
+        "capture_images_min": 1,
+        "capture_images_max": 5,
+        "capture_offset_after_start": 2.5,
+        "capture_offset_before_end": 2.0,
     },
     3: {
-        "direction": "coming",
-        "min_duration": 5.0,
-        "max_duration": 15.0,
-        "ideal_duration": 10.0,
-        "end_trim_seconds": 2.0,  # Example: Platform 3 removes 2 seconds
-        "backward_extension_seconds": 3.0,  # Example: Platform 3 extends backward by 3 seconds
+        "direction": "walking",
+        "min_duration": 3.0,
+        "max_duration": 10.0,
+        "ideal_duration": 6.0,
+        "end_trim_seconds": 0.0,
+        "backward_extension_seconds": 0.0,
+        "is_walking": True,
+        "start_offset_seconds": 0.0,
+        "capture_images": False,
+        "capture_images_mode": "group",
+        "capture_images_min": 1,
+        "capture_images_max": 5,
+        "capture_offset_after_start": None,
+        "capture_offset_before_end": None,
     },
-    # Add more platforms as needed
+    4: {
+        "direction": "kitting",
+        "min_duration": 20.0,
+        "max_duration": 60.0,
+        "ideal_duration": 30.0,
+        "end_trim_seconds": 0.0,
+        "backward_extension_seconds": 0.0,
+        "start_offset_seconds": 0.0,
+        "capture_images": False,
+        "capture_images_mode": "group",
+        "capture_images_min": 1,
+        "capture_images_max": 5,
+        "capture_offset_after_start": None,
+        "capture_offset_before_end": None,
+    },
+    5: {
+        "direction": "sitting",
+        "min_duration": 25.0,
+        "max_duration": 60.0,
+        "ideal_duration": 40.0,
+        "end_trim_seconds": 0.0,
+        "backward_extension_seconds": 0.0,
+        "start_offset_seconds": 0.0,
+        "capture_images": False,
+        "capture_images_mode": "group",
+        "capture_images_min": 1,
+        "capture_images_max": 5,
+        "capture_offset_after_start": None,
+        "capture_offset_before_end": None,
+    },
 }
 ```
 
-**Usage Examples**:
+---
 
-1. **Use platform configuration** (recommended):
+## Automatic Image Capture
 
-   ```python
-   result = detect_zipline_segment(
-       input_video_path="video.mp4",
-       platform_number=2,  # Uses platform 2's settings
-   )
-   ```
+When `capture_images` resolves to `True`, the detector calls `capture_images_from_video` immediately after producing a valid start/end range. The following happens automatically:
 
-2. **Override platform settings**:
+- The capture mode/min/max come from the platform entry unless the caller provided overrides.
+- `start_time` and `end_time` are forwarded so the capture pipeline only scans the trimmed portion of the video.
+- Extra context shots are taken at:
+  - `segment_start + capture_offset_after_start`
+  - `segment_end - capture_offset_before_end`
+  (when those offsets are positive and fall inside the range).
+- All capture results are attached to the detection response under `result["image_capture"]`, including a list of `extra_captures` with the forced zipline shots (`extra_after_start_*.jpg`, `extra_before_end_*.jpg`).
 
-   ```python
-   result = detect_zipline_segment(
-       input_video_path="video.mp4",
-       platform_number=2,  # Base settings from platform 2
-       ideal_duration=10.0,  # Override ideal_duration
-   )
-   ```
-
-3. **Use explicit parameters** (no platform):
-   ```python
-   result = detect_zipline_segment(
-       input_video_path="video.mp4",
-       direction="coming",
-       min_duration=2.0,
-       max_duration=20.0,
-       ideal_duration=8.0,
-       end_trim_seconds=2.0,  # Remove 2 seconds from end for "coming" videos
-       backward_extension_seconds=3.0,  # Extend backward by 3 seconds when duration is too short
-   )
-   ```
-
-**Parameter Priority**:
-
-1. Explicit parameters (if provided) override platform settings
-2. Platform settings (if `platform_number` provided)
-3. Default values (if neither platform nor explicit parameters)
+You can still call `capture_images_from_video` manually, but this integration keeps “trim + photo export” as a single step driven by the platform configuration.
 
 ---
 
@@ -357,6 +386,20 @@ After calculating initial start and end times, the following rules are applied *
 
 ---
 
+## Additional Directions
+
+Besides “coming” and “going”, the pipeline supports three utility directions that are selected automatically through the platform dictionary:
+
+| Direction | Detection Highlights | Typical Use |
+|-----------|---------------------|-------------|
+| `walking` | Motion is anchored at t=0, end time chosen from the last confident face detection near the desired duration. Used when the clip always begins with someone already in frame. |
+| `kitting` | Background subtraction tracks when the first person leaves a staging area; face detections determine the final person in frame. The algorithm enforces longer min/max durations (20–60 s). |
+| `sitting` | Pure face-tracking mode: start at the first face seen, end at the last face near video end. Designed for static harness checks where riders remain seated. |
+
+All three modes still honor `min_duration`, `max_duration`, and can take advantage of automated capture (for example, platform 5 can be toggled to capture group photos once we verify the desired behaviour).
+
+---
+
 ## Comparison Table
 
 | Aspect                    | Coming                                                                                       | Going                                       |
@@ -401,65 +444,6 @@ After calculating initial start and end times, the following rules are applied *
    - First: Extend forward (later) by 2 seconds → `end_time = end_time + 2.0` (if possible)
    - If still too short: Extend backward (earlier) by `backward_extension_seconds` → `start_time = start_time - backward_extension_seconds` (if possible)
 4. **Final**: Validate within bounds
-
----
-
-## Technical Details
-
-### Frame Sampling
-
-- Samples frames at ~10 frames per second for efficiency
-- Formula: `sample_interval = max(1, int(fps * 0.1))`
-- Reduces processing time while maintaining detection accuracy
-
-### Motion Detection Parameters (Coming)
-
-- Background subtractor: MOG2 with `history=500`, `varThreshold=50`, `detectShadows=True`
-- Minimum motion area: 1% of frame area
-- Growth detection window: 5 samples (~0.5 seconds)
-- Minimum growth factor: 2.0x (area must double to be considered rider)
-- Motion stop threshold: 5% of maximum detected area
-- Gap tolerance: 3 samples (~0.3 seconds)
-- Extension after motion stop: 1.5 seconds
-
-### Face Detection Parameters (Both)
-
-- Model: MediaPipe Face Detection (full-range, `model_selection=1`)
-- Confidence threshold: 0.5
-- Minimum face size: 6% of frame width
-- Stability requirement (Going): 3 consecutive detections
-- Minimum time between detections: 0.5 seconds
-
----
-
-## Return Values
-
-### Valid Result
-
-```json
-{
-  "input_video": "path/to/video.mp4",
-  "direction": "coming" | "going",
-  "start_time": 2.5,
-  "end_time": 12.3,
-  "duration": 9.8,
-  "valid": true,
-  "output_video": "path/to/output.mp4",  // if output_video_path was provided
-  "trimmed_video": "path/to/trimmed.mp4",  // if trim_output_path was provided
-  "platform_number": 2  // if platform_number was provided
-}
-```
-
-### Invalid Result
-
-```json
-{
-  "input_video": "path/to/video.mp4",
-  "direction": "coming" | "going",
-  "valid": false,
-  "reason": "Detected duration 1.5s is below minimum 2.0s (even after extending)"
-}
-```
 
 ---
 
