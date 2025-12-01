@@ -11,7 +11,7 @@ from typing import Optional, Dict, Any, List, Sequence
 import os
 from pathlib import Path
 
-# Import image capture functionality
+
 try:
     from capture_images import capture_images_from_video
 except ImportError:
@@ -1191,7 +1191,7 @@ def detect_zipline_segment(
             min_consecutive_hits = 3  # 3 consecutive detections for stability
 
             # Collect all face detections throughout the video
-            face_detections = []  # List of (time, confidence, bbox) tuples
+            face_detections = []  
             last_faces = []
             last_detection_confidence = 0.0
             last_detected_stable = False
