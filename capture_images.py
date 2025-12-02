@@ -1075,10 +1075,21 @@ def capture_images_from_video(
     # Sort candidates by score (highest first)
     candidate_frames.sort(key=lambda x: x["score"], reverse=True)
 
-    # Select frames to capture
-    num_to_capture = min(max_pictures, max(min_pictures, len(candidate_frames)))
+    # Enforce at most one photo per whole-second bucket:
+    # e.g. only one frame between t=1.00–1.99s, one between 2.00–2.99s, etc.
+    # We iterate in score order so each second keeps its "best" frame.
+    per_second_selection: List[Dict[str, Any]] = []
+    used_seconds = set()
+    for cand in candidate_frames:
+        second_bucket = int(cand["time"])
+        if second_bucket in used_seconds:
+            continue
+        per_second_selection.append(cand)
+        used_seconds.add(second_bucket)
+        if len(per_second_selection) >= max_pictures:
+            break
 
-    if len(candidate_frames) < min_pictures:
+    if len(per_second_selection) < min_pictures:
         return {
             "success": False,
             "error": f"Only found {len(candidate_frames)} valid frames, "
@@ -1087,10 +1098,12 @@ def capture_images_from_video(
             "output_dir": output_dir,
         }
 
+    # Final list to save
+    selected_frames = per_second_selection[:max_pictures]
+
     # Capture selected frames
     captured_files = []
-    for i in range(num_to_capture):
-        candidate = candidate_frames[i]
+    for candidate in selected_frames:
         frame = candidate["frame"]
         frame_time = candidate["time"]
 

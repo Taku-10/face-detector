@@ -394,7 +394,7 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "end_trim_seconds": 0.0,
         "backward_extension_seconds": 0.0,
         "start_offset_seconds": 0.0,
-        "capture_images": False,
+        "capture_images": True,
         "capture_images_mode": "group",
         "capture_images_min": 1,
         "capture_images_max": 5,
@@ -2559,7 +2559,7 @@ def detect_zipline_segment(
 
 if __name__ == "__main__":
     result = detect_zipline_segment(
-        input_video_path="going-1.MP4",
+        input_video_path="going/going-1.MP4",
         platform_number=1,
         show_frames=True,
     )
