@@ -77,24 +77,44 @@ def _add_image_capture_to_result(
             if isinstance(capture_result, dict)
             else None,
         )
-        if additional_captures:
-            if isinstance(capture_result, dict):
-                capture_result.setdefault("extra_captures", []).extend(
-                    additional_captures
-                )
-            else:
-                capture_result = {
-                    "success": True,
-                    "captured_files": [],
-                    "images_captured": 0,
-                    "candidates_found": 0,
-                    "output_dir": os.path.join(
-                        os.path.dirname(os.path.abspath(input_video_path)),
-                        f"{Path(input_video_path).stem}-images",
-                    ),
-                    "mode": capture_mode,
-                    "extra_captures": additional_captures,
-                }
+
+        if isinstance(capture_result, dict):
+            # Ensure captured_files + extra_captures stay within min/max bounds
+            captured_files = capture_result.get("captured_files", []) or []
+            extra_files = additional_captures or []
+
+            # If we have a max images setting, reserve space for extra captures
+            if capture_images_max is not None:
+                max_total = capture_images_max
+                # How many slots remain for the main captured_files after extras
+                allowed_main = max_total - len(extra_files)
+                if allowed_main < 0:
+                    allowed_main = 0
+                if len(captured_files) > allowed_main:
+                    captured_files = captured_files[:allowed_main]
+                    capture_result["captured_files"] = captured_files
+
+            # Recompute images_captured as main + extras
+            total_captured = len(captured_files) + len(extra_files)
+            capture_result["images_captured"] = total_captured
+
+            if extra_files:
+                capture_result.setdefault("extra_captures", []).extend(extra_files)
+
+        elif additional_captures:
+            # No structured capture_result (should not usually happen), synthesize one
+            capture_result = {
+                "success": True,
+                "captured_files": [],
+                "images_captured": len(additional_captures),
+                "candidates_found": 0,
+                "output_dir": os.path.join(
+                    os.path.dirname(os.path.abspath(input_video_path)),
+                    f"{Path(input_video_path).stem}-images",
+                ),
+                "mode": capture_mode,
+                "extra_captures": additional_captures,
+            }
         result["image_capture"] = capture_result
 
     return result
@@ -353,7 +373,7 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "capture_images_min": 1,
         "capture_images_max": 5,
         "capture_offset_after_start": 2.5,
-        "capture_offset_before_end": 2.0,
+        "capture_offset_before_end": 2.5,
     },
     3: {
         "direction": "walking",
@@ -1191,7 +1211,7 @@ def detect_zipline_segment(
             min_consecutive_hits = 3  # 3 consecutive detections for stability
 
             # Collect all face detections throughout the video
-            face_detections = []  
+            face_detections = []
             last_faces = []
             last_detection_confidence = 0.0
             last_detected_stable = False
@@ -2559,8 +2579,8 @@ def detect_zipline_segment(
 
 if __name__ == "__main__":
     result = detect_zipline_segment(
-        input_video_path="going/going-1.MP4",
-        platform_number=1,
+        input_video_path="drive-up/vid50.MP4",
+        platform_number=5,
         show_frames=True,
     )
 

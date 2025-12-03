@@ -383,6 +383,27 @@ def capture_images_from_video(
 
     os.makedirs(output_dir, exist_ok=True)
 
+    # Clean up old auto-generated images for this video so the directory
+    # only reflects the current run. We only delete files that match our
+    # naming patterns, to avoid touching anything custom the user put there.
+    for name in os.listdir(output_dir):
+        lower = name.lower()
+        if (
+            lower.startswith("frame_")
+            and lower.endswith(".jpg")
+        ) or (
+            lower.startswith("extra_after_start_")
+            and lower.endswith(".jpg")
+        ) or (
+            lower.startswith("extra_before_end_")
+            and lower.endswith(".jpg")
+        ):
+            try:
+                os.remove(os.path.join(output_dir, name))
+            except OSError:
+                # If a file cannot be removed, skip it and continue
+                pass
+
     # Open video
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
