@@ -27,6 +27,7 @@ def _add_image_capture_to_result(
     capture_images_mode: Optional[str],
     capture_images_min: Optional[int],
     capture_images_max: Optional[int],
+    capture_images_min_delay: float,
     platform_number: Optional[int],
     direction: str,
     show_progress: bool,
@@ -61,6 +62,7 @@ def _add_image_capture_to_result(
             mode=capture_mode,
             min_pictures=capture_images_min,
             max_pictures=capture_images_max,
+            min_delay_seconds=capture_images_min_delay,
             platform_number=platform_number,
             start_time=segment_start_time,
             end_time=segment_end_time,
@@ -357,6 +359,7 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "capture_images_mode": "going",
         "capture_images_min": 1,
         "capture_images_max": 5,
+        "capture_images_min_delay": 2.0,
         "capture_offset_after_start": 2.5,
         "capture_offset_before_end": 1.0,
     },
@@ -372,6 +375,7 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "capture_images_mode": "coming",
         "capture_images_min": 1,
         "capture_images_max": 5,
+        "capture_images_min_delay": 2.0,
         "capture_offset_after_start": 2.5,
         "capture_offset_before_end": 2.5,
     },
@@ -384,12 +388,13 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "backward_extension_seconds": 0.0,
         "is_walking": True,
         "start_offset_seconds": 0.0,
-        "capture_images": False,
+        "capture_images": True,
         "capture_images_mode": "group",
         "capture_images_min": 1,
         "capture_images_max": 5,
-        "capture_offset_after_start": None,
-        "capture_offset_before_end": None,
+        "capture_images_min_delay": 2.0,
+        "capture_offset_after_start": 1.5,
+        "capture_offset_before_end": 2,
     },
     4: {
         "direction": "kitting",
@@ -399,10 +404,11 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "end_trim_seconds": 0.0,
         "backward_extension_seconds": 0.0,
         "start_offset_seconds": 0.0,
-        "capture_images": False,
+        "capture_images": True,
         "capture_images_mode": "group",
         "capture_images_min": 1,
         "capture_images_max": 5,
+        "capture_images_min_delay": 2.0,
         "capture_offset_after_start": None,
         "capture_offset_before_end": None,
     },
@@ -418,6 +424,7 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "capture_images_mode": "group",
         "capture_images_min": 1,
         "capture_images_max": 5,
+        "capture_images_min_delay": 2.0,
         "capture_offset_after_start": None,
         "capture_offset_before_end": None,
     },
@@ -443,6 +450,7 @@ def detect_zipline_segment(
     capture_images_mode: Optional[str] = None,
     capture_images_min: Optional[int] = None,
     capture_images_max: Optional[int] = None,
+    capture_images_min_delay: Optional[float] = None,
     capture_offset_after_start: Optional[float] = None,
     capture_offset_before_end: Optional[float] = None,
 ) -> dict:
@@ -496,6 +504,9 @@ def detect_zipline_segment(
             - If None, uses platform configuration, then falls back to detection direction
         capture_images_min / capture_images_max: Optional overrides for number of images to capture
             - If None, use platform configuration when available
+        capture_images_min_delay: Optional minimum delay in seconds between image captures
+            - If None, use platform configuration when available (default: 2.0)
+            - After capturing an image at time T, the next image can only be captured at T + delay
         capture_offset_after_start: Optional number of seconds after the detected start
             where an additional frame should be forcibly captured (e.g., 2.0)
         capture_offset_before_end: Optional number of seconds before the detected end
@@ -620,6 +631,10 @@ def detect_zipline_segment(
             capture_images_min = platform_config.get("capture_images_min")
         if capture_images_max is None:
             capture_images_max = platform_config.get("capture_images_max")
+        if capture_images_min_delay is None:
+            capture_images_min_delay = platform_config.get(
+                "capture_images_min_delay", 2.0
+            )
         if capture_offset_after_start is None:
             capture_offset_after_start = platform_config.get(
                 "capture_offset_after_start"
@@ -647,6 +662,10 @@ def detect_zipline_segment(
         capture_images = False
     else:
         capture_images = bool(capture_images)
+    if capture_images_min_delay is None:
+        capture_images_min_delay = 2.0
+    else:
+        capture_images_min_delay = float(capture_images_min_delay)
     capture_offset_after_start = (
         float(capture_offset_after_start)
         if capture_offset_after_start is not None
@@ -1170,6 +1189,7 @@ def detect_zipline_segment(
                     capture_images_mode,
                     capture_images_min,
                     capture_images_max,
+                    capture_images_min_delay,
                     platform_number,
                     direction,
                     show_progress,
@@ -1913,6 +1933,7 @@ def detect_zipline_segment(
                     capture_images_mode,
                     capture_images_min,
                     capture_images_max,
+                    capture_images_min_delay,
                     platform_number,
                     direction,
                     show_progress,
@@ -2174,6 +2195,7 @@ def detect_zipline_segment(
                     capture_images_mode,
                     capture_images_min,
                     capture_images_max,
+                    capture_images_min_delay,
                     platform_number,
                     direction,
                     show_progress,
@@ -2545,6 +2567,7 @@ def detect_zipline_segment(
                     capture_images_mode,
                     capture_images_min,
                     capture_images_max,
+                    capture_images_min_delay,
                     platform_number,
                     direction,
                     show_progress,
@@ -2579,7 +2602,7 @@ def detect_zipline_segment(
 
 if __name__ == "__main__":
     result = detect_zipline_segment(
-        input_video_path="drive-up/vid50.MP4",
+        input_video_path="sitting/vid63.MP4",
         platform_number=5,
         show_frames=True,
     )

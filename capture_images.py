@@ -373,6 +373,7 @@ def capture_images_from_video(
     mode: Optional[str] = None,
     min_pictures: Optional[int] = None,
     max_pictures: Optional[int] = None,
+    min_delay_seconds: float = 2.0,
     platform_number: Optional[int] = None,
     output_dir: Optional[str] = None,
     sharpness_threshold: float = 100.0,
@@ -393,6 +394,8 @@ def capture_images_from_video(
             - If None, defaults to "going"
         min_pictures: Minimum number of pictures to capture (defaults to 5 if None)
         max_pictures: Maximum number of pictures to capture (defaults to 10 if None)
+        min_delay_seconds: Minimum delay in seconds between image captures (default: 2.0)
+            - After capturing an image at time T, the next image can only be captured at T + min_delay_seconds
         platform_number: Optional identifier carried through to the result (no longer alters behavior)
         output_dir: Output directory for images
             - If None, automatically generates: {video_name}-images in same directory as video
@@ -446,14 +449,9 @@ def capture_images_from_video(
     for name in os.listdir(output_dir):
         lower = name.lower()
         if (
-            lower.startswith("frame_")
-            and lower.endswith(".jpg")
-        ) or (
-            lower.startswith("extra_after_start_")
-            and lower.endswith(".jpg")
-        ) or (
-            lower.startswith("extra_before_end_")
-            and lower.endswith(".jpg")
+            (lower.startswith("frame_") and lower.endswith(".jpg"))
+            or (lower.startswith("extra_after_start_") and lower.endswith(".jpg"))
+            or (lower.startswith("extra_before_end_") and lower.endswith(".jpg"))
         ):
             try:
                 os.remove(os.path.join(output_dir, name))
@@ -631,9 +629,7 @@ def capture_images_from_video(
 
                         # Calculate score: base score from confidence and sharpness
                         # plus bonuses for smiling and eyes open
-                        base_score = (
-                            confidence * 0.5 + (sharpness_score / 500.0) * 0.25
-                        )
+                        base_score = confidence * 0.5 + (sharpness_score / 500.0) * 0.25
                         smile_bonus = smile_confidence * 0.15 if is_smiling else 0.0
                         eyes_bonus = eyes_open_conf * 0.1 if eyes_open else 0.0
                         total_score = base_score + smile_bonus + eyes_bonus
@@ -1004,9 +1000,7 @@ def capture_images_from_video(
                         is_smiling = last_detection_info.get("is_smiling", False)
                         smile_conf = last_detection_info.get("smile_confidence", 0.0)
                         eyes_open = last_detection_info.get("eyes_open", True)
-                        eyes_conf = last_detection_info.get(
-                            "eyes_open_confidence", 0.0
-                        )
+                        eyes_conf = last_detection_info.get("eyes_open_confidence", 0.0)
 
                         # Draw face bounding box
                         color = (0, 255, 0) if is_smiling else (255, 0, 0)
@@ -1236,32 +1230,37 @@ def capture_images_from_video(
         key=lambda x: (x.get("priority_level", 1), x["score"]), reverse=True
     )
 
-    # Enforce at most one photo per whole-second bucket:
-    # e.g. only one frame between t=1.00–1.99s, one between 2.00–2.99s, etc.
-    # We iterate in (priority, score) order so each second keeps its "best"
-    # quality frame first, then falls back to weaker ones if needed.
-    per_second_selection: List[Dict[str, Any]] = []
-    used_seconds = set()
+    # Enforce minimum delay between image captures:
+    # After capturing an image at time T, the next image can only be captured
+    # at T + min_delay_seconds or later.
+    # We iterate in (priority, score) order so we keep the "best" quality frames first.
+    selected_frames: List[Dict[str, Any]] = []
+    last_capture_time: Optional[float] = None
+
     for cand in candidate_frames:
-        second_bucket = int(cand["time"])
-        if second_bucket in used_seconds:
-            continue
-        per_second_selection.append(cand)
-        used_seconds.add(second_bucket)
-        if len(per_second_selection) >= max_pictures:
+        candidate_time = cand["time"]
+
+        # Check if this candidate is far enough from the last capture
+        if last_capture_time is not None:
+            time_since_last = candidate_time - last_capture_time
+            if time_since_last < min_delay_seconds:
+                continue  # Skip this candidate, too close to last capture
+
+        # Accept this candidate
+        selected_frames.append(cand)
+        last_capture_time = candidate_time
+
+        if len(selected_frames) >= max_pictures:
             break
 
-    if len(per_second_selection) < min_pictures:
+    if len(selected_frames) < min_pictures:
         return {
             "success": False,
-            "error": f"Only found {len(candidate_frames)} valid frames, "
+            "error": f"Only found {len(selected_frames)} valid frames with minimum delay of {min_delay_seconds}s, "
             f"but {min_pictures} required",
             "candidates_found": len(candidate_frames),
             "output_dir": output_dir,
         }
-
-    # Final list to save
-    selected_frames = per_second_selection[:max_pictures]
 
     # Capture selected frames
     captured_files = []
