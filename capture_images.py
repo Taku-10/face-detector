@@ -275,6 +275,63 @@ def is_face_looking_at_camera(
         return True
 
 
+def are_eyes_open(
+    face_landmarks, image_width: int, image_height: int
+) -> Tuple[bool, float]:
+    """
+    Heuristic check for whether both eyes appear open.
+
+    Uses a simple eye-aspect-ratio style metric on a subset of Face Mesh
+    landmarks. Returns (eyes_open, confidence).
+
+    This is intentionally conservative – if landmarks are missing or the
+    geometry looks weird, we default to eyes_open=True with low confidence
+    so that we don't accidentally discard otherwise good frames.
+    """
+    if not face_landmarks or not face_landmarks.landmark:
+        return True, 0.0
+
+    try:
+        lm = face_landmarks.landmark
+
+        # Common Face Mesh indices (approximate):
+        # Right eye: 33 (outer), 159 (upper), 145 (lower)
+        # Left eye: 263 (outer), 386 (upper), 374 (lower)
+        needed_indices = [33, 159, 145, 263, 386, 374]
+        if len(lm) <= max(needed_indices):
+            return True, 0.0
+
+        def eye_open_score(outer_idx: int, upper_idx: int, lower_idx: int) -> float:
+            outer = lm[outer_idx]
+            upper = lm[upper_idx]
+            lower = lm[lower_idx]
+            eye_width = abs(outer.x - ((upper.x + lower.x) / 2.0)) * image_width
+            eye_height = abs(upper.y - lower.y) * image_height
+            if eye_width <= 0:
+                return 0.0
+            ratio = eye_height / eye_width
+            # Typical "open" is a moderate ratio; extremely small -> closed/blink.
+            # Map ratio in [0.02, 0.08+] to [0, 1].
+            min_r, max_r = 0.02, 0.08
+            if ratio <= min_r:
+                return 0.0
+            if ratio >= max_r:
+                return 1.0
+            return (ratio - min_r) / (max_r - min_r)
+
+        right_score = eye_open_score(33, 159, 145)
+        left_score = eye_open_score(263, 386, 374)
+        score = min(right_score, left_score)
+
+        # Consider eyes open if both eyes have reasonable openness
+        eyes_open = score > 0.3
+        return eyes_open, float(score)
+
+    except (IndexError, AttributeError, ValueError):
+        # If we can't compute reliably, don't penalize the frame
+        return True, 0.0
+
+
 def is_in_guide_region(
     bbox: Tuple[int, int, int, int],
     frame_width: int,
@@ -436,9 +493,10 @@ def capture_images_from_video(
         min_tracking_confidence=0.5,
     )
 
-    # Initialize background subtractor for person detection (coming and group modes)
+    # Initialize background subtractor for person detection
+    # (used in coming/group modes, and as a low-priority fallback for going)
     bg_subtractor = None
-    if mode == "coming" or mode == "group":
+    if mode in ["coming", "group", "going"]:
         bg_subtractor = cv2.createBackgroundSubtractorMOG2(
             history=500, varThreshold=50, detectShadows=True
         )
@@ -505,8 +563,10 @@ def capture_images_from_video(
             last_detection_info = None  # Initialize for visualization
 
             if mode == "going":
-                # GOING MODE: Face detection with smile detection
+                # GOING MODE: Face detection with priorities and person fallback
                 face_results = face_detection.process(rgb_frame)
+
+                has_face_candidate = False
 
                 if face_results.detections:
                     # Find largest face
@@ -542,6 +602,8 @@ def capture_images_from_video(
                         is_frontal = False
                         is_smiling = False
                         smile_confidence = 0.0
+                        eyes_open = True
+                        eyes_open_conf = 0.0
 
                         if face_mesh_results.multi_face_landmarks:
                             face_landmarks = face_mesh_results.multi_face_landmarks[0]
@@ -551,16 +613,89 @@ def capture_images_from_video(
                             is_smiling, smile_confidence = detect_smile(
                                 face_landmarks, frame_width, frame_height
                             )
-
-                        # Only accept if face is looking at camera
-                        if is_frontal:
-                            # Calculate score: base score from confidence and sharpness
-                            # Bonus for smiling
-                            base_score = (
-                                confidence * 0.5 + (sharpness_score / 500.0) * 0.3
+                            eyes_open, eyes_open_conf = are_eyes_open(
+                                face_landmarks, frame_width, frame_height
                             )
-                            smile_bonus = smile_confidence * 0.2 if is_smiling else 0.0
-                            total_score = base_score + smile_bonus
+
+                        # Priority tiers for GOING mode (higher is better):
+                        #   4: Face + frontal + smiling + eyes open
+                        #   3: Face + frontal (+/- smile/eyes)
+                        #   2: Face (non‑frontal) but still valid size
+                        #   1: Person only (no face) – handled via bg_subtractor below
+                        if is_frontal and is_smiling and eyes_open:
+                            priority_level = 4
+                        elif is_frontal:
+                            priority_level = 3
+                        else:
+                            priority_level = 2
+
+                        # Calculate score: base score from confidence and sharpness
+                        # plus bonuses for smiling and eyes open
+                        base_score = (
+                            confidence * 0.5 + (sharpness_score / 500.0) * 0.25
+                        )
+                        smile_bonus = smile_confidence * 0.15 if is_smiling else 0.0
+                        eyes_bonus = eyes_open_conf * 0.1 if eyes_open else 0.0
+                        total_score = base_score + smile_bonus + eyes_bonus
+
+                        candidate_frames.append(
+                            {
+                                "frame": frame.copy(),
+                                "frame_count": frame_count,
+                                "time": frame_time,
+                                "score": total_score,
+                                "priority_level": priority_level,
+                                "confidence": confidence,
+                                "sharpness": sharpness_score,
+                                "is_smiling": is_smiling,
+                                "smile_confidence": smile_confidence,
+                                "eyes_open": eyes_open,
+                                "eyes_open_confidence": eyes_open_conf,
+                                "bbox": (x, y, w, h),
+                            }
+                        )
+                        has_face_candidate = True
+
+                        # Store detection info for visualization
+                        last_detection_info = {
+                            "bbox": (x, y, w, h),
+                            "confidence": confidence,
+                            "is_smiling": is_smiling,
+                            "smile_confidence": smile_confidence,
+                            "eyes_open": eyes_open,
+                            "eyes_open_confidence": eyes_open_conf,
+                            "sharpness": sharpness_score,
+                            "score": total_score,
+                            "is_frontal": is_frontal,
+                            "priority_level": priority_level,
+                        }
+
+                # If we didn't get a face candidate this frame, fall back to
+                # low‑priority person detection so that we still capture
+                # something for this time bucket in very hard cases.
+                if not has_face_candidate and bg_subtractor is not None:
+                    fg_mask = bg_subtractor.apply(frame)
+
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
+                    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+
+                    contours, _ = cv2.findContours(
+                        fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                    )
+
+                    if contours:
+                        largest_contour = max(contours, key=cv2.contourArea)
+                        area = cv2.contourArea(largest_contour)
+                        min_area = (frame_width * frame_height) * 0.01
+
+                        if area >= min_area:
+                            x, y, w, h = cv2.boundingRect(largest_contour)
+
+                            # Low‑priority score based mostly on area + sharpness
+                            area_score = (area / (frame_width * frame_height)) * 0.4
+                            sharp_score = (sharpness_score / 500.0) * 0.3
+                            total_score = area_score + sharp_score
 
                             candidate_frames.append(
                                 {
@@ -568,33 +703,20 @@ def capture_images_from_video(
                                     "frame_count": frame_count,
                                     "time": frame_time,
                                     "score": total_score,
-                                    "confidence": confidence,
+                                    "priority_level": 1,
                                     "sharpness": sharpness_score,
-                                    "is_smiling": is_smiling,
-                                    "smile_confidence": smile_confidence,
+                                    "has_face": False,
                                     "bbox": (x, y, w, h),
                                 }
                             )
 
-                            # Store detection info for visualization
                             last_detection_info = {
                                 "bbox": (x, y, w, h),
-                                "confidence": confidence,
-                                "is_smiling": is_smiling,
-                                "smile_confidence": smile_confidence,
+                                "has_face": False,
                                 "sharpness": sharpness_score,
                                 "score": total_score,
-                                "is_frontal": True,
-                            }
-                        else:
-                            last_detection_info = {
-                                "bbox": (x, y, w, h),
-                                "confidence": confidence,
-                                "is_smiling": False,
-                                "smile_confidence": 0.0,
-                                "sharpness": sharpness_score,
-                                "score": 0.0,
                                 "is_frontal": False,
+                                "priority_level": 1,
                             }
 
             elif mode == "coming":
@@ -688,6 +810,11 @@ def capture_images_from_video(
                                     "frame_count": frame_count,
                                     "time": frame_time,
                                     "score": score,
+                                    # For coming mode, we treat all accepted
+                                    # detections as the same tier (person/face),
+                                    # but still set a priority_level in case the
+                                    # selection logic wants to use it later.
+                                    "priority_level": 2 if has_face else 1,
                                     "sharpness": sharpness_score,
                                     "has_face": has_face,
                                     "bbox": (x, y, w, h),
@@ -814,12 +941,24 @@ def capture_images_from_video(
                         + detection_method_bonus
                     )
 
+                    # Priority tiers for GROUP mode:
+                    #   3: Faces AND people detected
+                    #   2: Faces only
+                    #   1: People only
+                    if person_count > 0 and face_count > 0:
+                        priority_level = 3
+                    elif face_count > 0:
+                        priority_level = 2
+                    else:
+                        priority_level = 1
+
                     candidate_frames.append(
                         {
                             "frame": frame.copy(),
                             "frame_count": frame_count,
                             "time": frame_time,
                             "score": total_score,
+                            "priority_level": priority_level,
                             "person_count": person_count,
                             "face_count": face_count,
                             "total_count": total_count,
@@ -849,23 +988,35 @@ def capture_images_from_video(
             display_frame = frame.copy()
 
             if mode == "going":
-                # Draw face detection
-                if last_detection_info and last_detection_info.get("is_frontal"):
+                # Draw face/person detection with priority tiers
+                if last_detection_info and last_detection_info.get("bbox") is not None:
                     x, y, w, h = last_detection_info["bbox"]
-                    confidence = last_detection_info["confidence"]
-                    is_smiling = last_detection_info["is_smiling"]
-                    smile_conf = last_detection_info["smile_confidence"]
-                    sharpness = last_detection_info["sharpness"]
-                    score = last_detection_info["score"]
+                    sharpness = last_detection_info.get("sharpness", 0.0)
+                    score = last_detection_info.get("score", 0.0)
+                    priority = last_detection_info.get("priority_level", 1)
 
-                    # Draw face bounding box
-                    color = (0, 255, 0) if is_smiling else (255, 0, 0)
+                    if last_detection_info.get("has_face") is False:
+                        # Person‑only fallback visualization
+                        color = (0, 165, 255)
+                        label = "Person (fallback)"
+                    else:
+                        confidence = last_detection_info.get("confidence", 0.0)
+                        is_smiling = last_detection_info.get("is_smiling", False)
+                        smile_conf = last_detection_info.get("smile_confidence", 0.0)
+                        eyes_open = last_detection_info.get("eyes_open", True)
+                        eyes_conf = last_detection_info.get(
+                            "eyes_open_confidence", 0.0
+                        )
+
+                        # Draw face bounding box
+                        color = (0, 255, 0) if is_smiling else (255, 0, 0)
+                        label = f"Face ({confidence:.2f})"
+                        if is_smiling:
+                            label += f" | Smile ({smile_conf:.2f})"
+                        if eyes_open:
+                            label += f" | Eyes ({eyes_conf:.2f})"
+
                     cv2.rectangle(display_frame, (x, y), (x + w, y + h), color, 3)
-
-                    # Draw labels
-                    label = f"Face ({confidence:.2f})"
-                    if is_smiling:
-                        label += f" | Smile ({smile_conf:.2f})"
                     cv2.putText(
                         display_frame,
                         label,
@@ -876,12 +1027,11 @@ def capture_images_from_video(
                         2,
                     )
 
-                    # Add info overlay
                     info_text = [
                         f"Time: {frame_time:.2f}s | Frame: {frame_count}",
                         f"Mode: {mode} | Candidates: {len(candidate_frames)}",
                         f"Sharpness: {sharpness:.1f} | Score: {score:.3f}",
-                        f"Status: {'ACCEPTED' if is_smiling else 'DETECTED'}",
+                        f"Tier: {priority}",
                     ]
                     for i, text in enumerate(info_text):
                         cv2.putText(
@@ -893,19 +1043,6 @@ def capture_images_from_video(
                             (255, 255, 255),
                             2,
                         )
-                elif last_detection_info:
-                    # Face detected but not frontal
-                    x, y, w, h = last_detection_info["bbox"]
-                    cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
-                    cv2.putText(
-                        display_frame,
-                        "Face (Not Frontal)",
-                        (x, y - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (0, 0, 255),
-                        2,
-                    )
                 else:
                     # No detection
                     cv2.putText(
@@ -1093,12 +1230,16 @@ def capture_images_from_video(
     if show_frames:
         cv2.destroyAllWindows()
 
-    # Sort candidates by score (highest first)
-    candidate_frames.sort(key=lambda x: x["score"], reverse=True)
+    # Sort candidates by priority then score (highest first).
+    # If priority_level is missing (older candidates), treat as 1.
+    candidate_frames.sort(
+        key=lambda x: (x.get("priority_level", 1), x["score"]), reverse=True
+    )
 
     # Enforce at most one photo per whole-second bucket:
     # e.g. only one frame between t=1.00–1.99s, one between 2.00–2.99s, etc.
-    # We iterate in score order so each second keeps its "best" frame.
+    # We iterate in (priority, score) order so each second keeps its "best"
+    # quality frame first, then falls back to weaker ones if needed.
     per_second_selection: List[Dict[str, Any]] = []
     used_seconds = set()
     for cand in candidate_frames:

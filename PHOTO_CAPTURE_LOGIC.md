@@ -8,17 +8,17 @@ This document describes how `capture_images.py` evaluates frames, ranks candidat
 
 `capture_images_from_video` accepts the following high-level arguments:
 
-| Parameter | Description |
-|-----------|-------------|
-| `video_path` | Source video to process. |
-| `mode` | `"going"`, `"coming"`, or `"group"`; controls which detectors run. Defaults to `"going"` when nothing is specified. |
-| `min_pictures` / `max_pictures` | Bounds on how many frames are saved after ranking candidates (defaults to 5/10). |
-| `platform_number` | Optional identifier echoed back inside the result (no longer changes behaviour—the detector relies on explicit parameters passed from `face-detection.py`). |
-| `output_dir` | Destination folder; defaults to `<video_name>-images` next to the video. |
-| `sharpness_threshold` | Frames below this Laplacian-variance value are skipped early (default 100). |
-| `show_progress` | Prints per-5-second status updates. |
-| `show_frames` | Opens an OpenCV window that overlays detections and debugging text. |
-| `start_time` / `end_time` | Restrict processing to a trimmed segment (used by `detect_zipline_segment`). |
+| Parameter                       | Description                                                                                                                                                 |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `video_path`                    | Source video to process.                                                                                                                                    |
+| `mode`                          | `"going"`, `"coming"`, or `"group"`; controls which detectors run. Defaults to `"going"` when nothing is specified.                                         |
+| `min_pictures` / `max_pictures` | Bounds on how many frames are saved after ranking candidates (defaults to 5/10).                                                                            |
+| `platform_number`               | Optional identifier echoed back inside the result (no longer changes behaviour—the detector relies on explicit parameters passed from `face-detection.py`). |
+| `output_dir`                    | Destination folder; defaults to `<video_name>-images` next to the video.                                                                                    |
+| `sharpness_threshold`           | Frames below this Laplacian-variance value are skipped early (default 100).                                                                                 |
+| `show_progress`                 | Prints per-5-second status updates.                                                                                                                         |
+| `show_frames`                   | Opens an OpenCV window that overlays detections and debugging text.                                                                                         |
+| `start_time` / `end_time`       | Restrict processing to a trimmed segment (used by `detect_zipline_segment`).                                                                                |
 
 > **Extra captures**: When the detection pipeline passes `capture_offset_after_start` or `capture_offset_before_end`, `face-detection.py` saves additional frames (`extra_after_start_*`, `extra_before_end_*`) after the main capture run completes. Those files are appended to `image_capture["extra_captures"]`.
 
@@ -33,41 +33,68 @@ This document describes how `capture_images.py` evaluates frames, ranks candidat
    - Converts the sampled frame to RGB for MediaPipe.
    - Rejects blurry frames before running expensive models.
 3. **Mode-specific detectors**
-   - Results in a list of candidate frames, each with a score and metadata used for overlays.
+   - Results in a list of candidate frames, each with a score, a **priority tier**, and metadata used for overlays.
 4. **Ranking & Export**
-   - Sorts candidates by score descending.
+   - Candidates are globally sorted by `(priority tier, score)` descending (higher tier wins; within a tier, higher score wins).
+   - The exporter enforces **at most one image per whole second**. For each integer-second bucket (e.g. `2` → [2.00 s, 2.99 s]), it keeps the best candidate in that bucket in priority/score order until `max_pictures` is reached.
    - Ensures we have at least `min_pictures`; otherwise the call returns `success=False` with a descriptive error.
-   - Saves the top `min(max_pictures, len(candidate_frames))` frames using the naming pattern `frame_<frame_idx>_t<seconds>.jpg`.
+   - Saves the selected frames using the naming pattern `frame_<frame_idx>_t<seconds>.jpg`.
 
 ---
 
 ## Mode Details
 
 ### Mode: `going`
-Focused on portrait-quality face shots:
 
-- Uses MediaPipe Face Detection (`model_selection=1`) plus Face Mesh for smile and frontal-orientation checks.
-- Face must cover ≥ 6 % of the frame width and remain frontal; the pipeline discards side profiles.
-- Score = facial confidence (50 %), sharpness (30 %), plus a smile bonus (20 %).
-- The visualization window highlights smiles in green and lists frame time, sharpness, smile confidence, and aggregate score.
+Focused on portrait-quality face shots, with explicit fallbacks:
+
+- Uses MediaPipe Face Detection (`model_selection=1`) plus Face Mesh for:
+  - Frontal-orientation checks (face roughly looking at the camera).
+  - Smile detection.
+  - A lightweight eyes-open heuristic (based on an eye-aspect-ratio style metric).
+- Face must cover ≥ 6 % of the frame width to be considered.
+
+For each sampled frame, the detector assigns a **priority tier** and a score:
+
+- **Tier 4 (best)**: Clear **face**, **frontal**, **smiling**, **eyes open**.
+- **Tier 3**: Clear **face**, **frontal** (eyes/smile may be neutral or low-confidence).
+- **Tier 2**: Clear **face**, but **not frontal** (side/angled profile) that still passes size checks.
+- **Tier 1 (fallback)**: **Person-only region** (coarse person blob from the frame) when no valid face candidate was available in that frame. This is used purely as a safety net so that we still capture “there is a rider here” frames even when the face models fail.
+
+Within a tier, the score emphasises:
+
+- Face detection confidence and sharpness (base).
+- Plus bonuses for **smile confidence** and **eyes-open confidence** when available.
+
+Because only one image is allowed per whole second, if multiple “going” candidates land in the same second, the exporter always prefers the **highest tier** first (e.g. Tier 4 over Tier 1), then the highest score within that tier.
 
 ### Mode: `coming`
+
 Captures riders approaching the camera while ignoring the guide standing at the launch platform:
 
 - Background subtractor (MOG2) isolates moving blobs. Candidates must cover ≥ 2 % of the frame.
 - The guide is filtered out using a configurable bottom-left “guide region”. We only keep detections whose bounding boxes are not fully inside that rectangle. Current defaults (also overridable per platform) are **40 %** of width and **80 %** of height.
 - Optionally looks for faces inside the contour; detections with a visible face get a score boost.
-- Score combines contour area, face bonus, and sharpness.
+- Score combines contour area, face bonus, and sharpness, and each accepted detection is tagged with:
+  - **Tier 2**: Person with at least one visible face outside the guide region.
+  - **Tier 1**: Person-only blob (no face, but still a valid moving rider outside the guide region).
+- The single-per-second rule still applies, so if several “coming” candidates collide in the same second bucket, Tier 2 wins over Tier 1, then higher score within the tier.
 - The overlay shows the guide region border, whether a candidate was rejected as “guide only”, and the current score.
 
 ### Mode: `group`
+
 Used for wide shots with multiple riders:
 
 - Runs both person detection (background subtraction) and face detection in parallel.
 - Counts people/faces and awards a bonus when both detectors agree (#people AND #faces > 0).
 - Faces only need to span ≥ 3 % of the frame to handle distant subjects.
 - Score = total count (main weight) + average face confidence + sharpness + agreement bonus.
-- Only candidate frames with a `total_count` ≥ 2 are considered valid.
+- A frame is only considered a **group** candidate if there are **2 or more people/faces in total**; a single person or a single face alone is never enough.
+- Each valid candidate is also assigned a **priority tier**:
+  - **Tier 3 (best)**: Combined detection of **2+ riders** where both face and person detectors fire (e.g. several people plus visible faces).
+  - **Tier 2**: **2+ faces** detected, but person blobs are weak or missing.
+  - **Tier 1**: **2+ people** detected from the person blobs, but no reliable faces.
+- As in other modes, when multiple group candidates fall within the same second, the exporter prefers higher tiers first, then higher scores inside the tier.
 
 ---
 
@@ -110,4 +137,3 @@ Enabling `show_frames=True` opens a live OpenCV window:
 - Press `q` to stop processing early (the function returns the current error state).
 
 ---
-
