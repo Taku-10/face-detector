@@ -548,17 +548,25 @@ def capture_images_from_video(
         if end_time is not None and frame_time > end_time:
             break
 
-        # Sample frames for efficiency
-        if frame_count % sample_interval == 0:
+        # For visualization, we need to detect faces on every frame 
+        # For processing, we sample frames for efficiency
+        should_process_frame = frame_count % sample_interval == 0
+        should_show_frame = show_frames
+
+        # Convert to RGB if we need to process or show this frame
+        if should_process_frame or should_show_frame:
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
+        # Sample frames for efficiency
+        if should_process_frame:
             # Check blurriness first (reject blurry frames early)
             if is_blurry(frame, sharpness_threshold):
                 frame_count += 1
                 continue
 
             sharpness_score = calculate_sharpness(frame)
-            last_detection_info = None  # Initialize for visualization
+            # Reset detection info only when processing a new frame
+            last_detection_info = None
 
             if mode == "going":
                 # GOING MODE: Face detection with priorities and person fallback
@@ -858,10 +866,13 @@ def capture_images_from_video(
                                 person_bboxes.append((x, y, w, h))
                                 person_count += 1
 
-                # 2. Detect faces
+                # 2. Detect faces 
+                # Store ALL detections for visualization 
+                # But only count validated faces for scoring
                 face_results = face_detection.process(rgb_frame)
                 face_count = 0
-                face_bboxes = []
+                face_bboxes = []  # Validated faces for scoring
+                all_face_bboxes = []  # All detected faces for visualization 
                 valid_faces = []
 
                 if face_results.detections:
@@ -881,7 +892,11 @@ def capture_images_from_video(
                         w = min(w, frame_width - x)
                         h = min(h, frame_height - y)
 
+                        # Store ALL detections for visualization
+                        all_face_bboxes.append((x, y, w, h))
+
                         # Check if face is large enough (at least 3% of frame width for groups)
+                        # and has sufficient confidence for scoring
                         min_face_width = int(frame_width * 0.03)
                         if (
                             w >= min_face_width
@@ -966,18 +981,32 @@ def capture_images_from_video(
                     )
 
                     # Store detection info for visualization
+                    # Include all_face_bboxes for visualization 
+                    last_detection_info = {
+                        "person_count": person_count,
+                        "face_count": face_count,
+                        "total_count": total_count,
+                        "person_bboxes": person_bboxes,
+                        "face_bboxes": face_bboxes,  # Validated faces for scoring
+                        "all_face_bboxes": all_face_bboxes,  # All faces for visualization
+                        "avg_confidence": avg_confidence,
+                        "sharpness": sharpness_score,
+                        "score": total_score,
+                    }
+                else:
+                    # Store all detections even if not enough for group requirement
+                    # This allows visualization to show all faces 
                     last_detection_info = {
                         "person_count": person_count,
                         "face_count": face_count,
                         "total_count": total_count,
                         "person_bboxes": person_bboxes,
                         "face_bboxes": face_bboxes,
-                        "avg_confidence": avg_confidence,
+                        "all_face_bboxes": all_face_bboxes,
+                        "avg_confidence": 0.0,
                         "sharpness": sharpness_score,
-                        "score": total_score,
+                        "score": 0.0,
                     }
-                else:
-                    last_detection_info = None
 
         # Create display frame with overlays if needed
         if show_frames:
@@ -1129,13 +1158,24 @@ def capture_images_from_video(
                     )
 
             elif mode == "group":
-                # Draw all detected people and faces
+                # Draw all detected people and faces 
+                # Detect faces on THIS frame for visualization 
+                face_results_viz = face_detection.process(rgb_frame)
+
+                # Draw people from last_detection_info if available
+                person_count = 0
+                person_bboxes = []
+                face_count = 0
+                total_count = 0.0
+                avg_confidence = 0.0
+                sharpness = 0.0
+                score = 0.0
+
                 if last_detection_info:
                     person_count = last_detection_info["person_count"]
+                    person_bboxes = last_detection_info["person_bboxes"]
                     face_count = last_detection_info["face_count"]
                     total_count = last_detection_info["total_count"]
-                    person_bboxes = last_detection_info["person_bboxes"]
-                    face_bboxes = last_detection_info["face_bboxes"]
                     avg_confidence = last_detection_info["avg_confidence"]
                     sharpness = last_detection_info["sharpness"]
                     score = last_detection_info["score"]
@@ -1154,10 +1194,17 @@ def capture_images_from_video(
                             2,
                         )
 
-                    # Draw bounding boxes for all faces (green)
-                    for i, (x, y, w, h) in enumerate(face_bboxes):
+                # Draw ALL detected faces directly from MediaPipe results
+                # This ensures we show ALL faces, not just validated ones
+                if face_results_viz and face_results_viz.detections:
+                    for i, det in enumerate(face_results_viz.detections):
+                        bbox = det.location_data.relative_bounding_box
+                        x = int(bbox.xmin * frame_width)
+                        y = int(bbox.ymin * frame_height)
+                        w = int(bbox.width * frame_width)
+                        h = int(bbox.height * frame_height)
                         color = (0, 255, 0)  # Green for faces
-                        cv2.rectangle(display_frame, (x, y), (x + w, y + h), color, 2)
+                        cv2.rectangle(display_frame, (x, y), (x + w, y + h), color, 3)
                         cv2.putText(
                             display_frame,
                             f"Face {i + 1}",
@@ -1168,24 +1215,32 @@ def capture_images_from_video(
                             2,
                         )
 
-                    # Add info overlay
-                    info_text = [
-                        f"Time: {frame_time:.2f}s | Frame: {frame_count}",
-                        f"Mode: {mode} | Candidates: {len(candidate_frames)}",
-                        f"People: {person_count} | Faces: {face_count} | Total: {total_count:.1f}",
-                        f"Avg Confidence: {avg_confidence:.2f} | Sharpness: {sharpness:.1f}",
-                        f"Score: {score:.3f} | Status: ACCEPTED",
-                    ]
-                    for i, text in enumerate(info_text):
-                        cv2.putText(
-                            display_frame,
-                            text,
-                            (10, 30 + i * 25),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
-                            (255, 255, 255),
-                            2,
-                        )
+                # Add info overlay
+                # Show both validated face count and total detected faces
+                total_detected_faces = (
+                    len(face_results_viz.detections)
+                    if face_results_viz and face_results_viz.detections
+                    else face_count
+                )
+                info_text = [
+                    f"Time: {frame_time:.2f}s | Frame: {frame_count}",
+                    f"Mode: {mode} | Candidates: {len(candidate_frames)}",
+                    f"People: {person_count} | Valid Faces: {face_count} | All Faces: {total_detected_faces} | Total: {total_count:.1f}",
+                    f"Avg Confidence: {avg_confidence:.2f} | Sharpness: {sharpness:.1f}",
+                    f"Score: {score:.3f} | Status: ACCEPTED"
+                    if total_count >= 2
+                    else f"Score: {score:.3f} | Status: NEEDS MORE",
+                ]
+                for i, text in enumerate(info_text):
+                    cv2.putText(
+                        display_frame,
+                        text,
+                        (10, 30 + i * 25),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255, 255, 255),
+                        2,
+                    )
                 else:
                     # No detection or less than 2 people/faces
                     cv2.putText(
