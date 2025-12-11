@@ -11,6 +11,14 @@ from typing import Optional, Dict, Any, List, Sequence
 import os
 from pathlib import Path
 
+# Optional: YOLOv8 pose for multi-person kitting
+try:
+    from ultralytics import YOLO
+
+    HAS_YOLO = True
+except ImportError:
+    HAS_YOLO = False
+
 
 try:
     from capture_images import capture_images_from_video
@@ -1513,12 +1521,27 @@ def detect_zipline_segment(
                 min_detection_confidence=0.5,
             )
 
-            # Initialize MediaPipe Pose for full body detection
-            mp_pose = mp.solutions.pose
-            pose = mp_pose.Pose(
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5,
-            )
+            # Initialize YOLOv8 pose for multi-person detection (kitting mode only)
+            if not HAS_YOLO:
+                return {
+                    "input_video": input_video_path,
+                    "direction": direction,
+                    "valid": False,
+                    "reason": "YOLOv8 (ultralytics) is required for kitting mode but not installed. Install with: pip install ultralytics",
+                    "platform_number": platform_number,
+                }
+
+            try:
+                yolo_pose_model = YOLO("yolov8n-pose.pt")
+                print("[kitting] Using YOLOv8 pose (multi-person).")
+            except Exception as e:
+                return {
+                    "input_video": input_video_path,
+                    "direction": direction,
+                    "valid": False,
+                    "reason": f"Failed to load YOLOv8 pose model: {e}",
+                    "platform_number": platform_number,
+                }
 
             # Face detection parameters
             frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -1527,9 +1550,10 @@ def detect_zipline_segment(
 
             # Motion detection threshold (for kitting: walking motion)
             frame_area = frame_width * frame_height
+            # Lower threshold to pick up smaller / distant movers so multiple people register
             min_motion_area = (
-                frame_area * 0.02
-            )  # 2% of frame - walking motion threshold
+                frame_area * 0.005
+            )  # 0.5% of frame - walking motion threshold
 
             # Track detections - person presence (face + motion together indicates walking)
             person_detections = []  # List of (time, has_face, has_motion, motion_area) tuples
@@ -1551,8 +1575,10 @@ def detect_zipline_segment(
                 # Detect faces on all frames
                 face_results = face_detection.process(rgb_frame)
                 has_face = False
+                face_count_valid = 0
+                face_boxes_valid: list[tuple[int, int, int, int]] = []
                 if face_results.detections:
-                    # Check if face is valid and large enough
+                    # Check all faces (not just one) so we can handle multiple people simultaneously
                     for det in face_results.detections:
                         bbox = det.location_data.relative_bounding_box
                         confidence = det.score[0]
@@ -1579,6 +1605,8 @@ def detect_zipline_segment(
                             and confidence >= 0.5
                         ):
                             has_face = True
+                            face_count_valid += 1
+                            face_boxes_valid.append((x, y, w, h))
                             face_records.append(
                                 {
                                     "time": frame_time,
@@ -1589,11 +1617,12 @@ def detect_zipline_segment(
                                     "center_y": float(y + h / 2),
                                 }
                             )
-                            break
 
                 # Detect motion on sampled frames
                 has_motion = False
                 motion_area = 0.0
+                motion_count = 0
+                person_bboxes: list[tuple[int, int, int, int]] = []
                 if frame_count % sample_interval == 0:
                     fg_mask = bg_subtractor.apply(frame)
                     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -1605,47 +1634,64 @@ def detect_zipline_segment(
                     )
 
                     if contours:
-                        largest_contour = max(contours, key=cv2.contourArea)
-                        area = cv2.contourArea(largest_contour)
-                        motion_area = float(area)
+                        # Count all sufficiently large motion blobs to allow multiple people
+                        for contour in contours:
+                            area = cv2.contourArea(contour)
+                            if area >= min_motion_area:
+                                x, y, w, h = cv2.boundingRect(contour)
+                                person_bboxes.append((x, y, w, h))
+                                motion_count += 1
+                                motion_area = max(motion_area, float(area))
 
-                        if motion_area >= min_motion_area:
+                        if motion_count > 0:
                             has_motion = True
 
-                # Detect pose (full body) on sampled frames
+                # Detect pose (full body) with YOLOv8 multi-person
                 has_person_body = False
-                if frame_count % sample_interval == 0:
-                    pose_results = pose.process(rgb_frame)
-                    if pose_results and pose_results.pose_landmarks:
-                        # Check if we have enough keypoints to indicate a person
-                        # Require at least torso/hip keypoints
-                        landmarks = pose_results.pose_landmarks.landmark
-                        # Check for key body points (shoulders, hips)
-                        if (
-                            landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER].visibility
-                            > 0.5
-                            or landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER].visibility
-                            > 0.5
-                            or landmarks[mp_pose.PoseLandmark.LEFT_HIP].visibility > 0.5
-                            or landmarks[mp_pose.PoseLandmark.RIGHT_HIP].visibility
-                            > 0.5
-                        ):
-                            has_person_body = True
-                else:
-                    # For non-sampled frames, still process pose for display
-                    pose_results = pose.process(rgb_frame)
+                pose_overlays = []
+                yolo_pose_count = 0
 
-                # Store person detection: person is "walking" if they have face AND (motion OR body detected)
-                # This filters out people just standing (no motion) vs walking (has motion)
-                is_person_walking = has_face and (has_motion or has_person_body)
+                if frame_count % sample_interval == 0:
+                    try:
+                        yolo_result = yolo_pose_model(frame, verbose=False)
+                        if yolo_result and len(yolo_result) > 0:
+                            r = yolo_result[0]
+                            if r.keypoints is not None:
+                                kps_list = (
+                                    r.keypoints.xy
+                                )  # list of tensors (num_people x 17 x 2)
+                                for kps in kps_list:
+                                    kps_np = kps.cpu().numpy()
+                                    if kps_np.size == 0:
+                                        continue
+                                    yolo_pose_count += 1
+                                    has_person_body = True
+                                    pose_overlays.append(
+                                        {"kps": kps_np, "normalized": False}
+                                    )
+                        print(
+                            f"[kitting] frame {frame_count}: yolo poses={yolo_pose_count}"
+                        )
+                    except Exception as e:
+                        print(f"[kitting] YOLO pose inference failed: {e}")
+
+                # Store person detection: allow multiple simultaneous people
+                # Count walking as any valid face plus motion/body; track how many faces/motion blobs we saw
+                walking_count = max(face_count_valid, motion_count, yolo_pose_count)
+                is_person_walking = walking_count > 0 and (
+                    has_motion or has_person_body or has_face
+                )
 
                 person_detections.append(
                     {
                         "time": frame_time,
                         "has_face": has_face,
+                        "face_count": face_count_valid,
                         "has_motion": has_motion,
+                        "motion_count": motion_count,
                         "has_person_body": has_person_body,
                         "is_walking": is_person_walking,
+                        "walking_count": walking_count,
                         "motion_area": motion_area,
                     }
                 )
@@ -1671,14 +1717,55 @@ def detect_zipline_segment(
                                 display_frame, (x, y), (x + w, y + h), (255, 0, 0), 3
                             )
 
-                    # Draw pose landmarks if detected
-                    if pose_results and pose_results.pose_landmarks:
-                        mp_drawing = mp.solutions.drawing_utils
-                        mp_drawing.draw_landmarks(
-                            display_frame,
-                            pose_results.pose_landmarks,
-                            mp_pose.POSE_CONNECTIONS,
-                        )
+                    # Draw YOLO pose skeletons for all detected people
+                    if pose_overlays:
+                        # YOLO skeleton connections (COCO format - 17 keypoints)
+                        yolo_skeleton = [
+                            (0, 1),  # nose to left_eye
+                            (0, 2),  # nose to right_eye
+                            (1, 3),  # left_eye to left_ear
+                            (2, 4),  # right_eye to right_ear
+                            (5, 6),  # left_shoulder to right_shoulder
+                            (5, 7),  # left_shoulder to left_elbow
+                            (7, 9),  # left_elbow to left_wrist
+                            (6, 8),  # right_shoulder to right_elbow
+                            (8, 10),  # right_elbow to right_wrist
+                            (5, 11),  # left_shoulder to left_hip
+                            (6, 12),  # right_shoulder to right_hip
+                            (11, 12),  # left_hip to right_hip
+                            (11, 13),  # left_hip to left_knee
+                            (13, 15),  # left_knee to left_ankle
+                            (12, 14),  # right_hip to right_knee
+                            (14, 16),  # right_knee to right_ankle
+                        ]
+
+                        for overlay in pose_overlays:
+                            kps = overlay["kps"]
+                            # Draw skeleton lines
+                            for a, b in yolo_skeleton:
+                                if a < len(kps) and b < len(kps):
+                                    pt1 = (int(kps[a][0]), int(kps[a][1]))
+                                    pt2 = (int(kps[b][0]), int(kps[b][1]))
+                                    # Only draw if both points are valid (non-zero)
+                                    if (
+                                        pt1[0] > 0
+                                        and pt1[1] > 0
+                                        and pt2[0] > 0
+                                        and pt2[1] > 0
+                                    ):
+                                        cv2.line(
+                                            display_frame, pt1, pt2, (0, 255, 0), 2
+                                        )
+                            # Draw keypoints
+                            for x, y in kps:
+                                if x > 0 and y > 0:  # Only draw valid keypoints
+                                    cv2.circle(
+                                        display_frame,
+                                        (int(x), int(y)),
+                                        3,
+                                        (0, 255, 0),
+                                        -1,
+                                    )
 
                     # Add overlay info
                     cv2.putText(
@@ -1712,7 +1799,7 @@ def detect_zipline_segment(
                         )
                         cv2.putText(
                             display_frame,
-                            f"Person: {status} | Face: {current_detection['has_face']} | Motion: {current_detection['has_motion']}",
+                            f"Person: {status} | Faces: {current_detection.get('face_count', 0)} | Motion blobs: {current_detection.get('motion_count', 0)}",
                             (10, 90),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.7,
@@ -1756,7 +1843,6 @@ def detect_zipline_segment(
 
             cap.release()
             face_detection.close()
-            pose.close()
             if video_writer:
                 video_writer.release()
             if show_frames:
@@ -2602,8 +2688,8 @@ def detect_zipline_segment(
 
 if __name__ == "__main__":
     result = detect_zipline_segment(
-        input_video_path="sitting/vid63.MP4",
-        platform_number=5,
+        input_video_path="kitting/vid13.MP4",
+        platform_number=4,
         show_frames=True,
     )
 
