@@ -379,7 +379,7 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "end_trim_seconds": 1.0,
         "backward_extension_seconds": 2.0,
         "start_offset_seconds": 0.0,
-        "capture_images": True,
+        "capture_images": False,
         "capture_images_mode": "coming",
         "capture_images_min": 1,
         "capture_images_max": 5,
@@ -1052,6 +1052,26 @@ def detect_zipline_segment(
                         if sample["area"] >= guide_filter_threshold:
                             segment_start_time = sample["time"]
                             break
+
+                # At this point, segment_start_time is based purely on motion.
+                # For "coming" videos where the rider starts very far away, this can
+                # still be too early (rider not really visible yet). We have
+                # face_detections collected, so we can refine the start time to be
+                # closer to when a clear face first appears.
+                if segment_start_time is not None and face_detections:
+                    first_face_time = face_detections[0]
+
+                    # Allow the clip to start up to this many seconds *before*
+                    # the first face, so we still see the rider entering while
+                    # avoiding very early frames where they're not in view.
+                    # We use a slightly longer window for "coming" videos so
+                    # we capture more of the ride instead of only the very end.
+                    max_lead_before_face = 3.0  # seconds
+
+                    if segment_start_time < first_face_time - max_lead_before_face:
+                        segment_start_time = max(
+                            0.0, first_face_time - max_lead_before_face
+                        )
 
                 # Determine end time based on ideal_duration
                 if segment_start_time is None:
@@ -2688,8 +2708,8 @@ def detect_zipline_segment(
 
 if __name__ == "__main__":
     result = detect_zipline_segment(
-        input_video_path="kitting/vid13.MP4",
-        platform_number=4,
+        input_video_path="vid26.MP4",
+        platform_number=2,
         show_frames=True,
     )
 
