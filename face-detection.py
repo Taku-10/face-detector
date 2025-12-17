@@ -77,34 +77,35 @@ def _add_image_capture_to_result(
             show_progress=show_progress,
             show_frames=show_frames,
         )
-        additional_captures = _capture_specific_offsets(
-            input_video_path,
-            segment_start_time,
-            segment_end_time,
-            capture_offset_after_start,
-            capture_offset_before_end,
-            capture_result.get("output_dir")
-            if isinstance(capture_result, dict)
-            else None,
-        )
 
+        additional_captures: List[str] = []
+
+        # If we have a structured result, we can respect capture_images_max
+        # when deciding whether to take extra offset-based captures.
         if isinstance(capture_result, dict):
-            # Ensure captured_files + extra_captures stay within min/max bounds
             captured_files = capture_result.get("captured_files", []) or []
+
+            if capture_images_max is not None:
+                # How many extra images we are allowed to add
+                remaining_slots = max(0, capture_images_max - len(captured_files))
+            else:
+                remaining_slots = None
+
+            # Only capture offset-based images if we have remaining slots
+            if remaining_slots is None or remaining_slots > 0:
+                additional_captures = _capture_specific_offsets(
+                    input_video_path,
+                    segment_start_time,
+                    segment_end_time,
+                    capture_offset_after_start,
+                    capture_offset_before_end,
+                    capture_result.get("output_dir"),
+                    max_captures=remaining_slots,
+                )
+
             extra_files = additional_captures or []
 
-            # If we have a max images setting, reserve space for extra captures
-            if capture_images_max is not None:
-                max_total = capture_images_max
-                # How many slots remain for the main captured_files after extras
-                allowed_main = max_total - len(extra_files)
-                if allowed_main < 0:
-                    allowed_main = 0
-                if len(captured_files) > allowed_main:
-                    captured_files = captured_files[:allowed_main]
-                    capture_result["captured_files"] = captured_files
-
-            # Recompute images_captured as main + extras
+            # Recompute images_captured as main + extras (both are <= max if set)
             total_captured = len(captured_files) + len(extra_files)
             capture_result["images_captured"] = total_captured
 
@@ -137,6 +138,7 @@ def _capture_specific_offsets(
     offset_after_start: Optional[float],
     offset_before_end: Optional[float],
     base_output_dir: Optional[str],
+    max_captures: Optional[int] = None,
 ) -> List[str]:
     if segment_start_time is None or segment_end_time is None:
         return []
@@ -162,7 +164,14 @@ def _capture_specific_offsets(
     os.makedirs(output_dir, exist_ok=True)
 
     captured_files: List[str] = []
+
+    # Helper to check if we have reached the maximum number of extra captures
+    def can_capture_more() -> bool:
+        return max_captures is None or len(captured_files) < max_captures
+
     if safe_after is not None:
+        if not can_capture_more():
+            return captured_files
         target_time = segment_start_time + safe_after
         if target_time < segment_end_time:
             captured = _capture_frame_at_time(
@@ -172,6 +181,8 @@ def _capture_specific_offsets(
                 captured_files.append(captured)
 
     if safe_before is not None:
+        if not can_capture_more():
+            return captured_files
         target_time = segment_end_time - safe_before
         if target_time > segment_start_time:
             captured = _capture_frame_at_time(
@@ -379,10 +390,10 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "end_trim_seconds": 1.0,
         "backward_extension_seconds": 2.0,
         "start_offset_seconds": 0.0,
-        "capture_images": False,
+        "capture_images": True,
         "capture_images_mode": "coming",
         "capture_images_min": 1,
-        "capture_images_max": 5,
+        "capture_images_max": 2,
         "capture_images_min_delay": 2.0,
         "capture_offset_after_start": 2.5,
         "capture_offset_before_end": 2.5,
@@ -2708,7 +2719,7 @@ def detect_zipline_segment(
 
 if __name__ == "__main__":
     result = detect_zipline_segment(
-        input_video_path="vid26.MP4",
+        input_video_path="vid28.MP4",
         platform_number=2,
         show_frames=True,
     )
