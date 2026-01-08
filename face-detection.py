@@ -22,9 +22,13 @@ except ImportError:
 
 
 try:
+    
     from .capture_images import capture_images_from_video
 except ImportError:
-    capture_images_from_video = None
+    try:
+        from capture_images import capture_images_from_video  
+    except ImportError:
+        capture_images_from_video = None
 
 
 def _add_image_capture_to_result(
@@ -71,9 +75,7 @@ def _add_image_capture_to_result(
         # DEBUG: Log image capture parameters
         print(f"DEBUG face_detection_core - About to call capture_images_from_video:")
         print(f"  - mode={capture_mode}")
-        print(
-            f"  - min_pictures={capture_images_min}, max_pictures={capture_images_max}"
-        )
+        print(f"  - min_pictures={capture_images_min}, max_pictures={capture_images_max}")
         print(f"  - output_dir={capture_images_output_dir}")
         print(f"  - start_time={segment_start_time}, end_time={segment_end_time}")
 
@@ -108,9 +110,7 @@ def _add_image_capture_to_result(
 
             # Only capture offset-based images if we have remaining slots
             if remaining_slots is None or remaining_slots > 0:
-                print(
-                    f"DEBUG face_detection_core - capture_images_from_video returned: {capture_result}"
-                )
+                print(f"DEBUG face_detection_core - capture_images_from_video returned: {capture_result}")
                 additional_captures = _capture_specific_offsets(
                     input_video_path,
                     segment_start_time,
@@ -194,13 +194,7 @@ def _capture_specific_offsets(
             return captured_files
         target_time = segment_start_time + safe_after
         if target_time < segment_end_time:
-            captured = _capture_frame_at_time(
-                video_path,
-                target_time,
-                output_dir,
-                f"after_start_{safe_after:.2f}",
-                filename_prefix,
-            )
+            captured = _capture_frame_at_time(video_path, target_time, output_dir, f"after_start_{safe_after:.2f}", filename_prefix)
             if captured:
                 captured_files.append(captured)
 
@@ -209,13 +203,7 @@ def _capture_specific_offsets(
             return captured_files
         target_time = segment_end_time - safe_before
         if target_time > segment_start_time:
-            captured = _capture_frame_at_time(
-                video_path,
-                target_time,
-                output_dir,
-                f"before_end_{safe_before:.2f}",
-                filename_prefix,
-            )
+            captured = _capture_frame_at_time(video_path, target_time, output_dir, f"before_end_{safe_before:.2f}", filename_prefix)
             if captured:
                 captured_files.append(captured)
 
@@ -410,7 +398,7 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "capture_images": True,
         "capture_images_mode": "going",
         "capture_images_min": 1,
-        "capture_images_max": 5,
+        "capture_images_max": 2,
         "capture_images_min_delay": 2.0,
         "capture_offset_after_start": 2.5,
         "capture_offset_before_end": 1.0,
@@ -426,7 +414,7 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "capture_images": True,
         "capture_images_mode": "coming",
         "capture_images_min": 1,
-        "capture_images_max": 2,
+        "capture_images_max": 1,
         "capture_images_min_delay": 2.0,
         "capture_offset_after_start": 2.5,
         "capture_offset_before_end": 2.5,
@@ -2933,8 +2921,8 @@ def detect_zipline_segment(
 
 if __name__ == "__main__":
     result = detect_zipline_segment(
-        input_video_path="demo-footage/GX010163.MP4",
-        platform_number=4,
+        input_video_path="new-videos/GX010209.MP4",
+        platform_number=1,
         show_frames=True,
     )
 

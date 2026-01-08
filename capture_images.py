@@ -16,6 +16,12 @@ from pathlib import Path
 DEFAULT_GUIDE_REGION_WIDTH_RATIO = 0.4
 DEFAULT_GUIDE_REGION_HEIGHT_RATIO = 0.8
 
+# For COMING mode, we want to avoid capturing riders that are still very small /
+# far away when no face is detected. We therefore require a minimum on‑screen
+# width (as a fraction of the full frame) before accepting a *person‑only*
+# candidate. True face detections are still allowed even when slightly smaller.
+COMING_MIN_PERSON_WIDTH_RATIO_NO_FACE = 0.12  # 12% of frame width
+
 
 def calculate_sharpness(frame: np.ndarray) -> float:
     """
@@ -381,6 +387,7 @@ def capture_images_from_video(
     show_frames: bool = False,
     start_time: Optional[float] = None,
     end_time: Optional[float] = None,
+    filename_prefix: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Capture images from video based on specified mode and criteria.
@@ -762,49 +769,112 @@ def capture_images_from_video(
                             guide_region_width_ratio,
                             guide_region_height_ratio,
                         ):
-                            # Also check if there's a face detected (to ensure rider, not just guide)
+                            # Check for faces detected outside guide region, and determine if any are frontal
                             face_results = face_detection.process(rgb_frame)
                             has_face = False
+                            has_frontal_face = False
+                            face_confidence = 0.0
 
                             if face_results.detections:
-                                # Check if any detected face is NOT in guide region
-                                for det in face_results.detections:
+                                # Process face mesh once for all faces
+                                mesh_results = face_mesh.process(rgb_frame)
+                                mesh_faces = (
+                                    list(mesh_results.multi_face_landmarks)
+                                    if mesh_results and mesh_results.multi_face_landmarks
+                                    else []
+                                )
+
+                                # Check all faces to find the best one (prefer frontal)
+                                for idx, det in enumerate(face_results.detections):
                                     bbox = det.location_data.relative_bounding_box
                                     face_x = int(bbox.xmin * frame_width)
                                     face_y = int(bbox.ymin * frame_height)
                                     face_w = int(bbox.width * frame_width)
                                     face_h = int(bbox.height * frame_height)
 
-                                    if not is_in_guide_region(
+                                    # Skip faces in guide region
+                                    if is_in_guide_region(
                                         (face_x, face_y, face_w, face_h),
                                         frame_width,
                                         frame_height,
                                         guide_region_width_ratio,
                                         guide_region_height_ratio,
                                     ):
-                                        has_face = True
-                                        break
+                                        continue
 
-                            # Accept frame if person detected outside guide region
-                            # Prefer frames with faces (rider) but also accept person detections
-                            score = (area / (frame_width * frame_height)) * 0.5
-                            if has_face:
-                                score += 0.5
+                                    # This face is outside guide region - mark as detected
+                                    has_face = True
+                                    det_confidence = float(det.score[0])
 
-                            # Add sharpness component
-                            score += (sharpness_score / 500.0) * 0.2
+                                    # Check if this face is frontal using face mesh
+                                    if mesh_faces:
+                                        lm_index = idx if idx < len(mesh_faces) else 0
+                                        try:
+                                            if is_face_looking_at_camera(
+                                                mesh_faces[lm_index],
+                                                frame_width,
+                                                frame_height,
+                                            ):
+                                                # Found a frontal face - this is the best candidate
+                                                has_frontal_face = True
+                                                face_confidence = det_confidence
+                                                # Don't break - continue checking to see if there's an even better one
+                                                # (though typically there's only one rider face)
+                                        except Exception:
+                                            # If mesh-based frontal check fails, keep this as non-frontal
+                                            if not has_frontal_face:
+                                                # Only update confidence if we haven't found a frontal face yet
+                                                face_confidence = max(face_confidence, det_confidence)
+                                    else:
+                                        # No mesh results, but we have a face
+                                        if not has_frontal_face:
+                                            face_confidence = max(face_confidence, det_confidence)
+
+                            # Before accepting a person‑only detection, make sure
+                            # the rider is not still tiny/far away. We use the
+                            # on‑screen width as a proxy for distance.
+                            person_width_ratio = w / float(frame_width)
+
+                            # Base score from motion and sharpness.
+                            area_score = (area / (frame_width * frame_height)) * 0.5
+                            sharp_score = (sharpness_score / 500.0) * 0.2
+
+                            # Face bonuses and priority tiers:
+                            #   3: Person + frontal face
+                            #   2: Person + non-frontal face
+                            #   1: Person-only (no face)
+                            face_bonus = 0.0
+                            priority_level = 1
+                            if has_frontal_face:
+                                priority_level = 3
+                                face_bonus = 0.7
+                            elif has_face:
+                                priority_level = 2
+                                face_bonus = 0.4
+
+                            score = area_score + sharp_score + face_bonus
 
                             person_outside_guide = (x + w) > (
                                 guide_region_width_px + guide_region_margin_px
                             )
-                            if not has_face and not person_outside_guide:
+
+                            # If there's no face yet AND the rider is still small
+                            # and hugging the guide region boundary, skip this
+                            # frame so that we don't capture very distant shots.
+                            if not has_face and (
+                                not person_outside_guide
+                                or person_width_ratio < COMING_MIN_PERSON_WIDTH_RATIO_NO_FACE
+                            ):
                                 last_detection_info = {
                                     "bbox": (x, y, w, h),
                                     "has_face": has_face,
+                                    "is_frontal": has_frontal_face,
                                     "sharpness": sharpness_score,
                                     "score": score,
                                     "area": area,
-                                    "rejected": "guide_only",
+                                    "rejected": "guide_only"
+                                    if not person_outside_guide
+                                    else "too_small",
                                 }
                                 continue
 
@@ -814,13 +884,11 @@ def capture_images_from_video(
                                     "frame_count": frame_count,
                                     "time": frame_time,
                                     "score": score,
-                                    # For coming mode, we treat all accepted
-                                    # detections as the same tier (person/face),
-                                    # but still set a priority_level in case the
-                                    # selection logic wants to use it later.
-                                    "priority_level": 2 if has_face else 1,
+                                    "priority_level": priority_level,
                                     "sharpness": sharpness_score,
                                     "has_face": has_face,
+                                    "is_frontal": has_frontal_face,
+                                    "face_confidence": face_confidence,
                                     "bbox": (x, y, w, h),
                                 }
                             )
@@ -829,10 +897,13 @@ def capture_images_from_video(
                             last_detection_info = {
                                 "bbox": (x, y, w, h),
                                 "has_face": has_face,
+                                "is_frontal": has_frontal_face,
+                                "face_confidence": face_confidence,
                                 "sharpness": sharpness_score,
                                 "score": score,
                                 "area": area,
                                 "rejected": None,
+                                "priority_level": priority_level,
                             }
 
             elif mode == "group":
@@ -1098,11 +1169,65 @@ def capture_images_from_video(
                     2,
                 )
 
+                # Draw face detections for visualization (even if not in last_detection_info)
+                face_results_viz = face_detection.process(rgb_frame)
+                if face_results_viz and face_results_viz.detections:
+                    for det in face_results_viz.detections:
+                        bbox = det.location_data.relative_bounding_box
+                        face_x = int(bbox.xmin * frame_width)
+                        face_y = int(bbox.ymin * frame_height)
+                        face_w = int(bbox.width * frame_width)
+                        face_h = int(bbox.height * frame_height)
+
+                        # Only draw faces outside guide region
+                        if not is_in_guide_region(
+                            (face_x, face_y, face_w, face_h),
+                            frame_width,
+                            frame_height,
+                            guide_region_width_ratio,
+                            guide_region_height_ratio,
+                        ):
+                            # Check if frontal using face mesh
+                            is_frontal_viz = False
+                            if face_mesh:
+                                mesh_results_viz = face_mesh.process(rgb_frame)
+                                if mesh_results_viz and mesh_results_viz.multi_face_landmarks:
+                                    try:
+                                        is_frontal_viz = is_face_looking_at_camera(
+                                            mesh_results_viz.multi_face_landmarks[0],
+                                            frame_width,
+                                            frame_height,
+                                        )
+                                    except Exception:
+                                        pass
+
+                            # Color: green for frontal, yellow for non-frontal
+                            face_color = (0, 255, 0) if is_frontal_viz else (0, 255, 255)
+                            cv2.rectangle(
+                                display_frame,
+                                (face_x, face_y),
+                                (face_x + face_w, face_y + face_h),
+                                face_color,
+                                2,
+                            )
+                            face_label = "Face (Frontal)" if is_frontal_viz else "Face"
+                            cv2.putText(
+                                display_frame,
+                                face_label,
+                                (face_x, face_y - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.5,
+                                face_color,
+                                2,
+                            )
+
                 if last_detection_info:
                     x, y, w, h = last_detection_info["bbox"]
                     has_face = last_detection_info["has_face"]
+                    is_frontal = last_detection_info.get("is_frontal", False)
                     sharpness = last_detection_info["sharpness"]
                     score = last_detection_info["score"]
+                    priority = last_detection_info.get("priority_level", 1)
                     rejected_reason = last_detection_info.get("rejected")
 
                     # Draw person bounding box
@@ -1112,8 +1237,15 @@ def capture_images_from_video(
                     # Draw label
                     if rejected_reason == "guide_only":
                         label = "Guide (filtered)"
+                    elif rejected_reason == "too_small":
+                        label = "Person (too small)"
                     else:
-                        label = f"Person ({'Rider' if has_face else 'No Face'})"
+                        if is_frontal:
+                            label = "Person (Frontal Face)"
+                        elif has_face:
+                            label = "Person (Face)"
+                        else:
+                            label = "Person (No Face)"
                     cv2.putText(
                         display_frame,
                         label,
@@ -1128,13 +1260,17 @@ def capture_images_from_video(
                     info_text = [
                         f"Time: {frame_time:.2f}s | Frame: {frame_count}",
                         f"Mode: {mode} | Candidates: {len(candidate_frames)}",
-                        f"Sharpness: {sharpness:.1f} | Score: {score:.3f}",
+                        f"Sharpness: {sharpness:.1f} | Score: {score:.3f} | Tier: {priority}",
                         (
                             "Status: ACCEPTED"
                             if rejected_reason is None
-                            else "Status: FILTERED"
+                            else f"Status: FILTERED ({rejected_reason})"
                         ),
                     ]
+                    if has_face:
+                        info_text.append(
+                            f"Face: {'Frontal' if is_frontal else 'Non-frontal'}"
+                        )
                     for i, text in enumerate(info_text):
                         cv2.putText(
                             display_frame,
@@ -1285,28 +1421,51 @@ def capture_images_from_video(
         key=lambda x: (x.get("priority_level", 1), x["score"]), reverse=True
     )
 
-    # Enforce minimum delay between image captures:
-    # After capturing an image at time T, the next image can only be captured
-    # at T + min_delay_seconds or later.
-    # We iterate in (priority, score) order so we keep the "best" quality frames first.
+    # Smart selection algorithm that prioritizes quality (frontal faces) while
+    # respecting min_delay_seconds. The algorithm:
+    # 1. First tries to select only the highest-tier candidates (Tier 3 for coming mode)
+    # 2. If we can't fill max_pictures with highest tier, adds next tier, etc.
+    # 3. Always respects min_delay_seconds between any two selected frames
     selected_frames: List[Dict[str, Any]] = []
-    last_capture_time: Optional[float] = None
-
+    
+    # Group candidates by priority tier
+    candidates_by_tier: Dict[int, List[Dict[str, Any]]] = {}
     for cand in candidate_frames:
-        candidate_time = cand["time"]
-
-        # Check if this candidate is far enough from the last capture
-        if last_capture_time is not None:
-            time_since_last = candidate_time - last_capture_time
-            if time_since_last < min_delay_seconds:
-                continue  # Skip this candidate, too close to last capture
-
-        # Accept this candidate
-        selected_frames.append(cand)
-        last_capture_time = candidate_time
-
+        tier = cand.get("priority_level", 1)
+        if tier not in candidates_by_tier:
+            candidates_by_tier[tier] = []
+        candidates_by_tier[tier].append(cand)
+    
+    # Sort tiers in descending order (highest priority first)
+    sorted_tiers = sorted(candidates_by_tier.keys(), reverse=True)
+    
+    # Try to fill selected_frames by iterating through tiers from highest to lowest
+    for tier in sorted_tiers:
+        tier_candidates = candidates_by_tier[tier]
+        
+        # For each candidate in this tier, check if it can be added
+        for cand in tier_candidates:
+            if len(selected_frames) >= max_pictures:
+                break
+            
+            candidate_time = cand["time"]
+            can_add = True
+            
+            # Check if this candidate is far enough from all existing captures
+            for selected in selected_frames:
+                time_diff = abs(candidate_time - selected["time"])
+                if time_diff < min_delay_seconds:
+                    can_add = False
+                    break
+            
+            if can_add:
+                selected_frames.append(cand)
+        
         if len(selected_frames) >= max_pictures:
             break
+    
+    # Sort selected frames by time to maintain chronological order in output
+    selected_frames.sort(key=lambda x: x["time"])
 
     if len(selected_frames) < min_pictures:
         return {
@@ -1323,8 +1482,11 @@ def capture_images_from_video(
         frame = candidate["frame"]
         frame_time = candidate["time"]
 
-        # Generate filename
-        filename = f"frame_{candidate['frame_count']:06d}_t{frame_time:.2f}s.jpg"
+        # Generate filename with optional prefix to prevent cleanup conflicts
+        if filename_prefix:
+            filename = f"{filename_prefix}_frame_{candidate['frame_count']:06d}_t{frame_time:.2f}s.jpg"
+        else:
+            filename = f"frame_{candidate['frame_count']:06d}_t{frame_time:.2f}s.jpg"
         filepath = os.path.join(output_dir, filename)
 
         # Save image
