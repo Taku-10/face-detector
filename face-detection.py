@@ -2921,7 +2921,7 @@ def detect_zipline_segment(
 
 if __name__ == "__main__":
     result = detect_zipline_segment(
-        input_video_path="new-videos/GX010209.MP4",
+        input_video_path="new-videos/GX010467.MP4",
         platform_number=1,
         show_frames=True,
     )

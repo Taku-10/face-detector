@@ -682,8 +682,9 @@ def capture_images_from_video(
                         }
 
                 # If we didn't get a face candidate this frame, fall back to
-                # low‑priority person detection so that we still capture
-                # something for this time bucket in very hard cases.
+                # low‑priority person detection for tier 1 (person going down zip line).
+                # We'll collect ALL tier 1 candidates throughout the segment,
+                # then select based on the face tier image time in the selection phase.
                 if not has_face_candidate and bg_subtractor is not None:
                     fg_mask = bg_subtractor.apply(frame)
 
@@ -696,28 +697,118 @@ def capture_images_from_video(
                     )
 
                     if contours:
-                        largest_contour = max(contours, key=cv2.contourArea)
-                        area = cv2.contourArea(largest_contour)
-                        min_area = (frame_width * frame_height) * 0.01
-
-                        if area >= min_area:
-                            x, y, w, h = cv2.boundingRect(largest_contour)
-
-                            # Low‑priority score based mostly on area + sharpness
-                            area_score = (area / (frame_width * frame_height)) * 0.4
-                            sharp_score = (sharpness_score / 500.0) * 0.3
-                            total_score = area_score + sharp_score
+                        # Sort contours by area (largest first) but we'll evaluate multiple
+                        # to find the best one that's not too large (too close) or too small (too far)
+                        sorted_contours = sorted(contours, key=cv2.contourArea, reverse=True)
+                        
+                        frame_area = frame_width * frame_height
+                        # For tier 1, we're only looking at the first 50% of the segment (person is closer)
+                        # Use lenient minimums to capture candidates, but prefer larger detections
+                        # Person must be at least 2% of frame area to be considered (very lenient for initial filtering)
+                        min_area = frame_area * 0.02  # Very lenient minimum for initial filtering
+                        # But we want to prefer person is close enough - prefer at least 6% area (person clearly visible)
+                        preferred_min_area = frame_area * 0.06  # Preferred minimum to ensure person is close enough
+                        max_area = frame_area * 0.30  # At most 30% of frame (not too close)
+                        
+                        best_contour = None
+                        best_area = 0.0  # Track the largest area (person closest)
+                        
+                        for contour in sorted_contours:
+                            area = cv2.contourArea(contour)
+                            
+                            # Skip if too small (too far) or too large (too close)
+                            if area < min_area or area > max_area:
+                                continue
+                            
+                            x, y, w, h = cv2.boundingRect(contour)
+                            
+                            # Validate it's likely a person (not just a hand, glove, or tree)
+                            # 1. Aspect ratio check: person should be taller than wide (typical ratio > 1.0)
+                            #    But allow some flexibility for different poses
+                            aspect_ratio = h / max(w, 1.0)
+                            
+                            # Reject if too wide (likely not a person, maybe a tree or horizontal object)
+                            # More lenient - allow wider detections to capture more candidates
+                            if aspect_ratio < 0.5:  # More lenient - allow slightly wider
+                                continue
+                            
+                            # 2. Size ratio check: width and height must be reasonable
+                            # Person must be visible - not a tiny dot far away
+                            width_ratio = w / float(frame_width)
+                            height_ratio = h / float(frame_height)
+                            
+                            # Very lenient size requirements for initial filtering - we'll pick the largest among valid ones
+                            # Person should have at least 3% width and 4% height (very lenient)
+                            if width_ratio < 0.03 or height_ratio < 0.04:
+                                continue
+                            
+                            # Additional validation: if very small, require better aspect ratio
+                            if area < frame_area * 0.03:  # Below 3% area
+                                # For very small detections, must be taller than wide (person-like)
+                                if aspect_ratio < 0.8:  # More lenient - allow slightly wider
+                                    continue
+                            
+                            # Prefer detections where person is close enough (at least 6% area)
+                            # But still consider smaller ones if no better option exists
+                            # We'll prioritize larger ones in the selection
+                            
+                            # 3. Position check: person should be in reasonable position
+                            # (not just at the very edge, which might be a false detection)
+                            center_x = x + w / 2.0
+                            center_y = y + h / 2.0
+                            
+                            # Person should be somewhat centered (not just at extreme edges)
+                            # Very lenient - only reject if very small AND at very extreme edge
+                            margin = 0.01  # 1% margin from edges (very lenient)
+                            if (center_x < frame_width * margin or 
+                                center_x > frame_width * (1 - margin) or
+                                center_y < frame_height * margin or
+                                center_y > frame_height * (1 - margin)):
+                                # For very small detections at extreme edges, likely noise - skip
+                                if area < frame_area * 0.02:  # Only reject very tiny edge detections
+                                    continue
+                            
+                            # Simple approach: pick the LARGEST valid detection (person closest to camera)
+                            # Simple approach: always pick the LARGEST valid detection (person closest to camera)
+                            # This ensures we capture something, and it will be the closest person
+                            if area > best_area:
+                                best_area = area
+                                best_contour = contour
+                        
+                        # If we found a valid person detection, add it as tier 1 candidate
+                        if best_contour is not None:
+                            x, y, w, h = cv2.boundingRect(best_contour)
+                            area = cv2.contourArea(best_contour)
+                            
+                            # Score based on area (larger = better, person closer)
+                            # Normalize to 0-1 range for scoring
+                            normalized_area = (area - min_area) / (max_area - min_area)
+                            
+                            # Score heavily based on area (larger = closer person)
+                            # Use area directly as the main score component
+                            # Normalize to 0-1 range, but give more weight to larger areas
+                            area_score = normalized_area ** 0.7  # Slight boost for larger areas
+                            
+                            # Bonus for meeting preferred minimum size (person is close enough)
+                            size_bonus = 0.0
+                            if area >= preferred_min_area:
+                                size_bonus = 0.4  # Significant bonus for preferred size
+                            
+                            # Score is just based on area - we'll select based on time window in selection phase
+                            # No time bonus needed since we filter by time window during selection
+                            score = area_score + size_bonus
 
                             candidate_frames.append(
                                 {
                                     "frame": frame.copy(),
                                     "frame_count": frame_count,
                                     "time": frame_time,
-                                    "score": total_score,
+                                    "score": score,
                                     "priority_level": 1,
                                     "sharpness": sharpness_score,
                                     "has_face": False,
                                     "bbox": (x, y, w, h),
+                                    "area": area,
                                 }
                             )
 
@@ -725,9 +816,10 @@ def capture_images_from_video(
                                 "bbox": (x, y, w, h),
                                 "has_face": False,
                                 "sharpness": sharpness_score,
-                                "score": total_score,
+                                "score": score,
                                 "is_frontal": False,
                                 "priority_level": 1,
+                                "area": area,
                             }
 
             elif mode == "coming":
@@ -1415,6 +1507,9 @@ def capture_images_from_video(
     if show_frames:
         cv2.destroyAllWindows()
 
+    # Removed old fallback logic - using simpler approach:
+    # Find tier 4/3/2 image time, then look forward 2 seconds from there for tier 1
+
     # Sort candidates by priority then score (highest first).
     # If priority_level is missing (older candidates), treat as 1.
     candidate_frames.sort(
@@ -1426,6 +1521,7 @@ def capture_images_from_video(
     # 1. First tries to select only the highest-tier candidates (Tier 3 for coming mode)
     # 2. If we can't fill max_pictures with highest tier, adds next tier, etc.
     # 3. Always respects min_delay_seconds between any two selected frames
+    # 4. For "going" mode: ensures 1 image from tier 4/3/2 AND 1 image from tier 1
     selected_frames: List[Dict[str, Any]] = []
     
     # Group candidates by priority tier
@@ -1439,33 +1535,308 @@ def capture_images_from_video(
     # Sort tiers in descending order (highest priority first)
     sorted_tiers = sorted(candidates_by_tier.keys(), reverse=True)
     
-    # Try to fill selected_frames by iterating through tiers from highest to lowest
-    for tier in sorted_tiers:
-        tier_candidates = candidates_by_tier[tier]
+    # Special handling for "going" mode: ensure 1 from tier 4/3/2 and 1 from tier 1
+    if mode == "going":
+        has_face_tier = False  # Track if we have tier 4, 3, or 2
+        has_tier_1 = False  # Track if we have tier 1
         
-        # For each candidate in this tier, check if it can be added
-        for cand in tier_candidates:
+        # First, try to get 1 from tier 4/3/2 (face detections)
+        for tier in sorted_tiers:
+            if tier >= 2:  # Tier 4, 3, or 2
+                tier_candidates = candidates_by_tier[tier]
+                for cand in tier_candidates:
+                    candidate_time = cand["time"]
+                    can_add = True
+                    
+                    # Check if this candidate is far enough from all existing captures
+                    for selected in selected_frames:
+                        time_diff = abs(candidate_time - selected["time"])
+                        if time_diff < min_delay_seconds:
+                            can_add = False
+                            break
+                    
+                    if can_add:
+                        selected_frames.append(cand)
+                        has_face_tier = True
+                        break  # Only need 1 from tier 4/3/2
+                
+                if has_face_tier:
+                    break  # Found one, move on to tier 1
+        
+        # Then, try to get 1 "tier 1" image for going mode.
+        # SIMPLIFIED APPROACH:
+        #   - Find the time of the tier 4/3/2 image we selected.
+        #   - Look forward 2 seconds from there.
+        #   - Among ALL candidates (any tier) in that window, pick the one with the largest area.
+        #   - Treat that chosen candidate as our tier 1 image (person going down the zip line).
+        #
+        # This guarantees the second image is close in time to the first (face) image and
+        # avoids brittle dependencies on background subtraction in this narrow window.
+        if has_face_tier:
+            # Find the time of the tier 4/3/2 image we selected
+            face_tier_time = None
+            face_tier_candidate = None
+            for selected in selected_frames:
+                if selected.get("priority_level", 1) >= 2:
+                    face_tier_time = selected.get("time")
+                    face_tier_candidate = selected
+                    break
+
+            if face_tier_time is not None:
+                # Define 2-second window after the face-tier capture
+                # Add a minimum time gap (0.3 seconds) to ensure different frames
+                min_time_gap = 0.3
+                tier_1_window_start = face_tier_time + min_time_gap
+                tier_1_window_end = face_tier_time + 2.0
+                
+                # Get the face tier frame_count to exclude it
+                face_tier_frame_count = face_tier_candidate.get("frame_count") if face_tier_candidate else None
+
+                # Look at ALL candidates (any tier) that fall in this time window
+                # BUT exclude the face tier candidate itself (by frame_count and time)
+                # Also exclude any candidate that's too close in time (less than 0.3s gap)
+                window_candidates: List[Dict[str, Any]] = []
+                for c in candidate_frames:
+                    c_time = c.get("time", 0.0)
+                    c_frame_count = c.get("frame_count")
+                    
+                    # Must be in the time window
+                    if not (tier_1_window_start <= c_time <= tier_1_window_end):
+                        continue
+                    
+                    # Must be different frame
+                    if c_frame_count == face_tier_frame_count:
+                        continue
+                    
+                    # Must be different time (with some tolerance for floating point)
+                    if abs(c_time - face_tier_time) < 0.1:
+                        continue
+                    
+                    # Must be at least 0.3s after face tier time
+                    if c_time < tier_1_window_start:
+                        continue
+                    
+                    window_candidates.append(c)
+
+                if show_progress:
+                    all_times = [round(c.get("time", 0.0), 2) for c in candidate_frames]
+                    window_times = [round(c.get("time", 0.0), 2) for c in window_candidates]
+                    print(f"Tier 1: Face tier image at {face_tier_time:.2f}s")
+                    print(f"Tier 1: Looking for ANY candidates in window {tier_1_window_start:.2f}s to {tier_1_window_end:.2f}s")
+                    print(f"Tier 1: All candidate times: {all_times[:30]}")
+                    print(f"Tier 1: Window candidate times: {window_times}")
+
+                if window_candidates:
+                    # Some candidates (older code paths) might not have 'area'. Fallback to bbox area or score.
+                    def candidate_area(c: Dict[str, Any]) -> float:
+                        if "area" in c and c["area"] is not None:
+                            return float(c["area"])
+                        bbox = c.get("bbox")
+                        if bbox is not None:
+                            _, _, w, h = bbox
+                            return float(w) * float(h)
+                        return float(c.get("score", 0.0))
+
+                    # Pick the candidate with the largest effective area in the window
+                    best_tier_1_src = max(window_candidates, key=candidate_area)
+
+                    # Safety check: Make absolutely sure this is NOT the same frame as face tier
+                    if (best_tier_1_src.get("frame_count") == face_tier_frame_count or
+                        best_tier_1_src.get("time", 0.0) == face_tier_time):
+                        if show_progress:
+                            print(
+                                f"Tier 1: WARNING - Best candidate is same frame as face tier! "
+                                f"Frame: {best_tier_1_src.get('frame_count')}, Time: {best_tier_1_src.get('time', 0.0):.2f}s"
+                            )
+                        # Remove this candidate and try again
+                        window_candidates = [c for c in window_candidates 
+                                           if (c.get("frame_count") != face_tier_frame_count and
+                                               c.get("time", 0.0) != face_tier_time)]
+                        if window_candidates:
+                            best_tier_1_src = max(window_candidates, key=candidate_area)
+                        else:
+                            # No other candidates in window, will fall through to extended window logic
+                            best_tier_1_src = None
+
+                    if best_tier_1_src is not None:
+                        # Make a shallow copy and override priority_level to 1 so validation sees it as "tier 1"
+                        best_tier_1 = dict(best_tier_1_src)
+                        best_tier_1["priority_level"] = 1
+
+                        # For this specific pair (face tier + window tier 1), we allow them to be close in time,
+                        # so we do NOT enforce min_delay_seconds between them.
+                        selected_frames.append(best_tier_1)
+                        has_tier_1 = True
+                    else:
+                        # No valid candidates in window, will fall through to extended window logic below
+                        if show_progress:
+                            print("Tier 1: No valid candidates in 2s window after filtering out face tier frame")
+
+                    if show_progress:
+                        print(
+                            "Tier 1: Selected from 2s window after face tier "
+                            f"({face_tier_time:.2f}s) with area={candidate_area(best_tier_1_src):.0f} "
+                            f"at t={best_tier_1.get('time', 0.0):.2f}s"
+                        )
+                else:
+                    # No candidates at all in the 2 second window
+                    # Try looking at exactly 1 second after the face tier time as fallback
+                    if show_progress:
+                        print(
+                            "Tier 1: No candidates found in 2s window "
+                            f"({tier_1_window_start:.2f}s to {tier_1_window_end:.2f}s). "
+                            f"Trying fallback: looking for candidates around 1s after face tier ({face_tier_time + 1.0:.2f}s)..."
+                        )
+                    
+                    # Look for candidates around 1 second after face tier (within 0.5s tolerance)
+                    fallback_target_time = face_tier_time + 1.0
+                    fallback_window_start = fallback_target_time - 0.3
+                    fallback_window_end = min(fallback_target_time + 0.3, tier_1_window_end)  # Don't exceed 2s window
+                    
+                    fallback_candidates: List[Dict[str, Any]] = [
+                        c
+                        for c in candidate_frames
+                        if (fallback_window_start <= c.get("time", 0.0) <= fallback_window_end
+                            and c.get("frame_count") != face_tier_frame_count
+                            and abs(c.get("time", 0.0) - face_tier_time) >= 0.1)
+                    ]
+                    
+                    if fallback_candidates:
+                        def candidate_area(c: Dict[str, Any]) -> float:
+                            if "area" in c and c["area"] is not None:
+                                return float(c["area"])
+                            bbox = c.get("bbox")
+                            if bbox is not None:
+                                _, _, w, h = bbox
+                                return float(w) * float(h)
+                            return float(c.get("score", 0.0))
+                        
+                        best_tier_1_src = max(fallback_candidates, key=candidate_area)
+                        best_tier_1 = dict(best_tier_1_src)
+                        best_tier_1["priority_level"] = 1
+                        selected_frames.append(best_tier_1)
+                        has_tier_1 = True
+                        
+                        if show_progress:
+                            print(
+                                f"Tier 1: Selected from fallback window at {best_tier_1.get('time', 0.0):.2f}s "
+                                f"(area={candidate_area(best_tier_1_src):.0f})"
+                            )
+                    else:
+                        # No candidates found even in fallback - must fail
+                        if show_progress:
+                            print(
+                                "Tier 1: ERROR - No candidates found in 2s window or fallback. "
+                                "Tier 1 must be within 2 seconds of face tier image."
+                            )
+                        # Don't add anything - let validation catch this
+        
+        # If we still have room and haven't filled requirements, continue with normal selection
+        # but prioritize filling the missing requirement
+        # NOTE: For tier 1, we ONLY select from the 2-second window after face tier - NO FALLBACK
+        if len(selected_frames) < max_pictures:
+            # If we're missing tier 1, we should have already tried the 2-second window approach
+            # Don't add any fallback here - tier 1 must come from the 2-second window only
+            # The second pass should have handled collecting candidates in that window
+            if not has_tier_1:
+                if show_progress:
+                    print("Tier 1: Still missing - no candidates found in 2-second window after face tier")
+                    # Don't try to add tier 1 from outside the window - this would be wrong
+            
+            # If we're missing face tier, prioritize it
+            if not has_face_tier:
+                for tier in sorted_tiers:
+                    if tier >= 2:  # Tier 4, 3, or 2
+                        tier_candidates = candidates_by_tier[tier]
+                        for cand in tier_candidates:
+                            if len(selected_frames) >= max_pictures:
+                                break
+                            candidate_time = cand["time"]
+                            can_add = True
+                            for selected in selected_frames:
+                                time_diff = abs(candidate_time - selected["time"])
+                                if time_diff < min_delay_seconds:
+                                    can_add = False
+                                    break
+                            if can_add:
+                                selected_frames.append(cand)
+                                has_face_tier = True
+                                break
+                        if has_face_tier:
+                            break
+            
+            # Fill remaining slots with any available candidates
+            # BUT: For tier 1 in "going" mode, we ONLY use candidates from the 2-second window
+            # So skip tier 1 here - it should have been handled above
+            for tier in sorted_tiers:
+                if len(selected_frames) >= max_pictures:
+                    break
+                # Skip tier 1 for "going" mode - it must come from the 2-second window only
+                if tier == 1:
+                    continue
+                tier_candidates = candidates_by_tier[tier]
+                for cand in tier_candidates:
+                    if len(selected_frames) >= max_pictures:
+                        break
+                    candidate_time = cand["time"]
+                    can_add = True
+                    for selected in selected_frames:
+                        time_diff = abs(candidate_time - selected["time"])
+                        if time_diff < min_delay_seconds:
+                            can_add = False
+                            break
+                    if can_add:
+                        selected_frames.append(cand)
+    else:
+        # For other modes (coming, group), use the original selection logic
+        # Try to fill selected_frames by iterating through tiers from highest to lowest
+        for tier in sorted_tiers:
+            tier_candidates = candidates_by_tier[tier]
+            
+            # For each candidate in this tier, check if it can be added
+            for cand in tier_candidates:
+                if len(selected_frames) >= max_pictures:
+                    break
+                
+                candidate_time = cand["time"]
+                can_add = True
+                
+                # Check if this candidate is far enough from all existing captures
+                for selected in selected_frames:
+                    time_diff = abs(candidate_time - selected["time"])
+                    if time_diff < min_delay_seconds:
+                        can_add = False
+                        break
+                
+                if can_add:
+                    selected_frames.append(cand)
+            
             if len(selected_frames) >= max_pictures:
                 break
-            
-            candidate_time = cand["time"]
-            can_add = True
-            
-            # Check if this candidate is far enough from all existing captures
-            for selected in selected_frames:
-                time_diff = abs(candidate_time - selected["time"])
-                if time_diff < min_delay_seconds:
-                    can_add = False
-                    break
-            
-            if can_add:
-                selected_frames.append(cand)
-        
-        if len(selected_frames) >= max_pictures:
-            break
     
     # Sort selected frames by time to maintain chronological order in output
     selected_frames.sort(key=lambda x: x["time"])
+
+    # For "going" mode, check if we have both required types
+    if mode == "going":
+        has_face_tier = any(c.get("priority_level", 1) >= 2 for c in selected_frames)
+        has_tier_1 = any(c.get("priority_level", 1) == 1 for c in selected_frames)
+        
+        if not has_face_tier or not has_tier_1:
+            missing = []
+            if not has_face_tier:
+                missing.append("tier 4/3/2 (face detection)")
+            if not has_tier_1:
+                missing.append("tier 1 (person-only)")
+            
+            return {
+                "success": False,
+                "error": f"For going mode, need 1 image from tier 4/3/2 AND 1 from tier 1. "
+                f"Missing: {', '.join(missing)}. "
+                f"Found {len(selected_frames)} frames total.",
+                "candidates_found": len(candidate_frames),
+                "output_dir": output_dir,
+            }
 
     if len(selected_frames) < min_pictures:
         return {
@@ -1504,6 +1875,8 @@ def capture_images_from_video(
     }
     if platform_number is not None:
         result["platform_number"] = platform_number
+    if mode == "going":
+        result["tier_1_method"] = "2s window after face tier image"
 
     if show_progress:
         print("\nCapture complete!")
