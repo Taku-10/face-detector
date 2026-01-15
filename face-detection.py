@@ -51,14 +51,11 @@ def _add_image_capture_to_result(
     filename_prefix: Optional[str] = None,
 ) -> dict:
     """Helper function to add image capture results to detection result."""
-    # Capture images regardless of whether AI detection succeeded or failed
-    # If detection failed, we'll use the fallback time range (full video duration)
-    if (
-        capture_images
-        and segment_start_time is not None
-        and segment_end_time is not None
-        and capture_images_from_video is not None
-    ):
+    # Capture images regardless of whether AI detection succeeded or failed.
+    # For most directions we use the detected (trimmed) segment; for WALKING+BRIDGE
+    # we intentionally ignore the trim and let the image capture pipeline look at
+    # the tail of the FULL video instead (last 5 seconds of the raw file).
+    if capture_images and capture_images_from_video is not None:
         # Determine capture mode
         capture_mode = capture_images_mode
         if capture_mode is None:
@@ -72,12 +69,24 @@ def _add_image_capture_to_result(
             else:
                 capture_mode = "going"  # Default
 
+        # Decide the time range we pass into capture_images_from_video:
+        # - Normal case: use the detected segment [segment_start_time, segment_end_time]
+        # - Special case for WALKING + BRIDGE capture:
+        #     Let the capture pipeline itself decide the last 5 seconds of the FULL video
+        #     by passing no explicit time range.
+        capture_start = segment_start_time
+        capture_end = segment_end_time
+
+        if direction == "walking" and capture_mode == "bridge":
+            capture_start = None
+            capture_end = None
+
         # DEBUG: Log image capture parameters
         print(f"DEBUG face_detection_core - About to call capture_images_from_video:")
         print(f"  - mode={capture_mode}")
         print(f"  - min_pictures={capture_images_min}, max_pictures={capture_images_max}")
         print(f"  - output_dir={capture_images_output_dir}")
-        print(f"  - start_time={segment_start_time}, end_time={segment_end_time}")
+        print(f"  - start_time={capture_start}, end_time={capture_end}")
 
         # Capture images from the detected segment
         capture_result = capture_images_from_video(
@@ -87,8 +96,8 @@ def _add_image_capture_to_result(
             max_pictures=capture_images_max,
             min_delay_seconds=capture_images_min_delay,
             platform_number=platform_number,
-            start_time=segment_start_time,
-            end_time=segment_end_time,
+            start_time=capture_start,
+            end_time=capture_end,
             show_progress=show_progress,
             show_frames=show_frames,
             output_dir=capture_images_output_dir,
@@ -429,9 +438,9 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "is_walking": True,
         "start_offset_seconds": 0.0,
         "capture_images": True,
-        "capture_images_mode": "group",
+        "capture_images_mode": "bridge",
         "capture_images_min": 1,
-        "capture_images_max": 5,
+        "capture_images_max": 1,
         "capture_images_min_delay": 2.0,
         "capture_offset_after_start": 1.5,
         "capture_offset_before_end": 2,
@@ -542,7 +551,7 @@ def detect_zipline_segment(
             - If platform_number is provided and this is None, uses the platform's configured start_offset_seconds
         capture_images: Optional bool to enable image capture within the detected window
             - If None, defers to the platform configuration (default False)
-        capture_images_mode: Optional capture mode override ("going", "coming", "group")
+        capture_images_mode: Optional capture mode override ("going", "coming", "group", "bridge")
             - If None, uses platform configuration, then falls back to detection direction
         capture_images_min / capture_images_max: Optional overrides for number of images to capture
             - If None, use platform configuration when available
@@ -2921,8 +2930,8 @@ def detect_zipline_segment(
 
 if __name__ == "__main__":
     result = detect_zipline_segment(
-        input_video_path="new-videos/GX010470.MP4",
-        platform_number=2,
+        input_video_path="new-videos/GX010469.MP4",
+        platform_number=3,
         show_frames=True,
     )
 
