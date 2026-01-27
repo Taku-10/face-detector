@@ -89,20 +89,6 @@ def _add_image_capture_to_result(
         print(f"  - output_dir={capture_images_output_dir}")
         print(f"  - start_time={capture_start}, end_time={capture_end}")
 
-        # Optional: hard-coded polygonal detection area for testing.
-        # Coordinates are normalised (x, y) in [0, 1] relative to frame width/height.
-        detection_polygon_norm = [
-            [0.23381371110709173, 0.018615942389573526],
-            [0.2757205818855924, 0.36068185210987264],
-            [0.37050993245601055, 0.6442598083546801],
-            [0.49722832742909584, 0.9242930401464275],
-            [0.5790465037109305, 0.828585479913805],
-            [0.5750553731605971, 0.6141296505036693],
-            [0.5780487210733471, 0.4280316167180144],
-            [0.5431263287579299, 0.2525677562915397],
-            [0.4672948483015954, 0.01507121793651343],
-        ]
-
         # Capture images from the detected segment
         capture_result = capture_images_from_video(
             video_path=input_video_path,
@@ -117,7 +103,6 @@ def _add_image_capture_to_result(
             show_frames=show_frames,
             output_dir=capture_images_output_dir,
             filename_prefix=filename_prefix,
-            detection_area=detection_polygon_norm,
         )
 
         additional_captures: List[str] = []
