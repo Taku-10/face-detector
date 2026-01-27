@@ -22,11 +22,10 @@ except ImportError:
 
 
 try:
-    
     from .capture_images import capture_images_from_video
 except ImportError:
     try:
-        from capture_images import capture_images_from_video  
+        from capture_images import capture_images_from_video
     except ImportError:
         capture_images_from_video = None
 
@@ -84,9 +83,25 @@ def _add_image_capture_to_result(
         # DEBUG: Log image capture parameters
         print(f"DEBUG face_detection_core - About to call capture_images_from_video:")
         print(f"  - mode={capture_mode}")
-        print(f"  - min_pictures={capture_images_min}, max_pictures={capture_images_max}")
+        print(
+            f"  - min_pictures={capture_images_min}, max_pictures={capture_images_max}"
+        )
         print(f"  - output_dir={capture_images_output_dir}")
         print(f"  - start_time={capture_start}, end_time={capture_end}")
+
+        # Optional: hard-coded polygonal detection area for testing.
+        # Coordinates are normalised (x, y) in [0, 1] relative to frame width/height.
+        detection_polygon_norm = [
+            [0.23381371110709173, 0.018615942389573526],
+            [0.2757205818855924, 0.36068185210987264],
+            [0.37050993245601055, 0.6442598083546801],
+            [0.49722832742909584, 0.9242930401464275],
+            [0.5790465037109305, 0.828585479913805],
+            [0.5750553731605971, 0.6141296505036693],
+            [0.5780487210733471, 0.4280316167180144],
+            [0.5431263287579299, 0.2525677562915397],
+            [0.4672948483015954, 0.01507121793651343],
+        ]
 
         # Capture images from the detected segment
         capture_result = capture_images_from_video(
@@ -102,6 +117,7 @@ def _add_image_capture_to_result(
             show_frames=show_frames,
             output_dir=capture_images_output_dir,
             filename_prefix=filename_prefix,
+            detection_area=detection_polygon_norm,
         )
 
         additional_captures: List[str] = []
@@ -119,7 +135,9 @@ def _add_image_capture_to_result(
 
             # Only capture offset-based images if we have remaining slots
             if remaining_slots is None or remaining_slots > 0:
-                print(f"DEBUG face_detection_core - capture_images_from_video returned: {capture_result}")
+                print(
+                    f"DEBUG face_detection_core - capture_images_from_video returned: {capture_result}"
+                )
                 additional_captures = _capture_specific_offsets(
                     input_video_path,
                     segment_start_time,
@@ -203,7 +221,13 @@ def _capture_specific_offsets(
             return captured_files
         target_time = segment_start_time + safe_after
         if target_time < segment_end_time:
-            captured = _capture_frame_at_time(video_path, target_time, output_dir, f"after_start_{safe_after:.2f}", filename_prefix)
+            captured = _capture_frame_at_time(
+                video_path,
+                target_time,
+                output_dir,
+                f"after_start_{safe_after:.2f}",
+                filename_prefix,
+            )
             if captured:
                 captured_files.append(captured)
 
@@ -212,7 +236,13 @@ def _capture_specific_offsets(
             return captured_files
         target_time = segment_end_time - safe_before
         if target_time > segment_start_time:
-            captured = _capture_frame_at_time(video_path, target_time, output_dir, f"before_end_{safe_before:.2f}", filename_prefix)
+            captured = _capture_frame_at_time(
+                video_path,
+                target_time,
+                output_dir,
+                f"before_end_{safe_before:.2f}",
+                filename_prefix,
+            )
             if captured:
                 captured_files.append(captured)
 
@@ -2930,8 +2960,8 @@ def detect_zipline_segment(
 
 if __name__ == "__main__":
     result = detect_zipline_segment(
-        input_video_path="new-videos/GX010469.MP4",
-        platform_number=3,
+        input_video_path="GX010739.MP4",
+        platform_number=1,
         show_frames=True,
     )
 
