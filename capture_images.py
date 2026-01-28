@@ -993,8 +993,19 @@ def capture_images_from_video(
                     w = min(w, frame_width - x)
                     h = min(h, frame_height - y)
 
-                    # Check if face is large enough (at least 6% of frame width)
-                    min_face_width = int(frame_width * 0.06)
+                    # Check if face is large enough.
+                    # Previously this used a hard-coded 6% of the FULL frame width,
+                    # which is too strict now that we often constrain a smaller
+                    # detection_area (polygon/rect). Instead we use:
+                    #   - 4% of the detection area's width when present, OR
+                    #   - 4% of the full frame width otherwise.
+                    effective_width = float(frame_width)
+                    if detection_rect_px is not None:
+                        ax1, _, ax2, _ = detection_rect_px
+                        rect_width = max(0.0, ax2 - ax1)
+                        if rect_width > 0:
+                            effective_width = rect_width
+                    min_face_width = int(effective_width * 0.04)
                     if w >= min_face_width and h >= min_face_width:
                         # Get face mesh for smile detection and frontal check
                         face_mesh_results = face_mesh.process(rgb_frame)
