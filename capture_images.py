@@ -550,10 +550,6 @@ def capture_images_from_video(
     start_time: Optional[float] = None,
     end_time: Optional[float] = None,
     filename_prefix: Optional[str] = None,
-    # detection_area can be:
-    #  - None (no restriction)
-    #  - (ax1, ay1, ax2, ay2) in pixels
-    #  - sequence of points [[x_norm, y_norm], ...] (0–1 normalized) OR [[x_px, y_px], ...] in pixels
     detection_area: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
@@ -588,17 +584,6 @@ def capture_images_from_video(
     Returns:
         Dictionary with capture results (Any type for flexibility)
     """
-    # For coming mode: Trim last 1 second from end_time to avoid guide's hand cutting camera
-    # This is a safety measure in addition to any trimming done in video detection
-    if mode == "coming" and end_time is not None and start_time is not None:
-        original_end_time = end_time
-        end_time = max(
-            start_time + 0.1, end_time - 1.0
-        )  # Remove 1 second, but ensure end > start
-        if show_progress and original_end_time != end_time:
-            print(
-                f"Coming mode: Trimmed end_time from {original_end_time:.2f}s to {end_time:.2f}s to avoid guide's hand"
-            )
 
     guide_region_width_ratio = DEFAULT_GUIDE_REGION_WIDTH_RATIO
     guide_region_height_ratio = DEFAULT_GUIDE_REGION_HEIGHT_RATIO
@@ -666,13 +651,7 @@ def capture_images_from_video(
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     video_duration = total_frames / fps if fps > 0 else 0.0
 
-    # ------------------------------------------------------------------
-    # Normalise detection_area into either:
-    #   - detection_rect_px: (ax1, ay1, ax2, ay2) in pixels
-    #   - detection_polygon_px: [(x, y), ...] in pixels (arbitrary polygon)
-    # The caller can pass a rectangle or an arbitrary polygon in normalised
-    # (0–1) or absolute pixel coordinates.
-    # ------------------------------------------------------------------
+    # Normalise detection_area 
     detection_rect_px: Optional[Tuple[float, float, float, float]] = None
     detection_polygon_px: Optional[List[Tuple[float, float]]] = None
 
@@ -685,7 +664,7 @@ def capture_images_from_video(
                 and isinstance(detection_area[0], (list, tuple))
                 and len(detection_area[0]) >= 2
             ):
-                raw_points = detection_area  # type: ignore[assignment]
+                raw_points = detection_area  
                 poly_px: List[Tuple[float, float]] = []
                 for pt in raw_points:
                     px, py = float(pt[0]), float(pt[1])
@@ -715,7 +694,7 @@ def capture_images_from_video(
                 isinstance(detection_area, (list, tuple))
                 and len(detection_area) == 4
             ):
-                ax1, ay1, ax2, ay2 = detection_area  # type: ignore[misc]
+                ax1, ay1, ax2, ay2 = detection_area  
                 detection_rect_px = (float(ax1), float(ay1), float(ax2), float(ay2))
 
                 if show_progress:
@@ -764,8 +743,8 @@ def capture_images_from_video(
             inter_area = float(ix2 - ix1) * float(iy2 - iy1)
             overlap_ratio = inter_area / box_area
 
-            # Require at least 80% of the box area to lie inside the detection area
-            inside = overlap_ratio >= 0.8
+            # Require at least 50% of the box area to lie inside the detection area.
+            inside = overlap_ratio >= 0.5
             if show_progress:
                 print(
                     f"[detection_area][rect] bbox=({x},{y},{w},{h}) "
@@ -791,7 +770,7 @@ def capture_images_from_video(
                             inside = not inside
                 return inside
 
-            samples_per_side = 10  # 10x10 grid inside the bbox
+            samples_per_side = 10 
             inside_count = 0
             total_samples = samples_per_side * samples_per_side
 
@@ -805,8 +784,8 @@ def capture_images_from_video(
 
             overlap_ratio = inside_count / float(total_samples)
 
-            # Require at least 80% of the box area to lie inside the detection polygon
-            inside = overlap_ratio >= 0.8
+            # Require at least 50% of the box area to lie inside the detection polygon
+            inside = overlap_ratio >= 0.5
             if show_progress:
                 print(
                     f"[detection_area][poly] bbox=({x},{y},{w},{h}) "
@@ -826,10 +805,9 @@ def capture_images_from_video(
     # Initialize MediaPipe
     mp_face_detection = mp.solutions.face_detection
     mp_face_mesh = mp.solutions.face_mesh
-
     face_detection = mp_face_detection.FaceDetection(
         model_selection=1,  # Full-range model
-        min_detection_confidence=0.5,
+        min_detection_confidence=0.3,
     )
 
     face_mesh = mp_face_mesh.FaceMesh(
@@ -915,19 +893,6 @@ def capture_images_from_video(
         if end_time is not None and frame_time > end_time:
             break
 
-        # For coming mode: Only process frames from the second half of the video segment
-        # Person is far away at the start and only gets close towards the end.
-        # If segment is 2s-8s (duration 6s), only process from 5s onwards (2s + 6s*0.5).
-        if mode == "coming" and start_time is not None and end_time is not None:
-            segment_duration = end_time - start_time
-            if segment_duration > 0:
-                process_from_time = start_time + (
-                    segment_duration * 0.5
-                )  # Start from 50% of segment
-                if frame_time < process_from_time:
-                    frame_count += 1
-                    continue
-
         # For bridge mode: ONLY consider frames in the LAST 5 SECONDS of the video
         # region we are scanning. If start/end are provided, that's the trimmed
         # region; if not, it's the full video [0, video_duration].
@@ -993,12 +958,7 @@ def capture_images_from_video(
                     w = min(w, frame_width - x)
                     h = min(h, frame_height - y)
 
-                    # Check if face is large enough.
-                    # Previously this used a hard-coded 6% of the FULL frame width,
-                    # which is too strict now that we often constrain a smaller
-                    # detection_area (polygon/rect). Instead we use:
-                    #   - 4% of the detection area's width when present, OR
-                    #   - 4% of the full frame width otherwise.
+                    # Check if face is large enough (at leat 4% of frame width).
                     effective_width = float(frame_width)
                     if detection_rect_px is not None:
                         ax1, _, ax2, _ = detection_rect_px
@@ -1160,8 +1120,8 @@ def capture_images_from_video(
                             }
 
             elif mode == "coming":
-                # COMING MODE: Person detection filtering out guide
-                # Use background subtraction for person detection
+                # COMING MODE (simplified): person detection within detection_area.
+                # We Rely on the configured detection_area to exclude the guide
                 if bg_subtractor is None:
                     frame_count += 1
                     continue
@@ -1181,350 +1141,135 @@ def capture_images_from_video(
                 )
 
                 if contours:
-                    # Sort contours by area and try the largest ones
-                    # Sometimes the largest might be noise, so we'll check a few
+                    # Sort contours by area and try the largest ones.
                     sorted_contours = sorted(
                         contours, key=cv2.contourArea, reverse=True
                     )
 
-                    # Try up to 3 largest contours to find a valid person
+                    # Try up to 3 largest contours to find a valid person.
                     person_found = False
                     for contour in sorted_contours[:3]:
                         area = cv2.contourArea(contour)
 
-                        # Lower threshold for coming mode - person might be smaller when far away
-                        min_area = (
-                            frame_width * frame_height
-                        ) * 0.01  # 1% instead of 2%
+                        # Lower threshold for coming mode - person might be smaller when far away.
+                        min_area = (frame_width * frame_height) * 0.01
+                        if area < min_area:
+                            continue
 
-                        if area >= min_area:
-                            x, y, w, h = cv2.boundingRect(contour)
+                        x, y, w, h = cv2.boundingRect(contour)
 
-                            # Check for faces FIRST to determine if both guide and rider are visible
-                            # This allows us to accept frames where person is in guide region BUT rider is also visible
-                            face_results = face_detection.process(rgb_frame)
-                            total_face_count = (
-                                len(face_results.detections)
-                                if face_results.detections
-                                else 0
+                        # Basic face detection for tiering (no guide-region logic).
+                        has_face = False
+                        has_frontal_face = False
+                        face_confidence = 0.0
+
+                        face_results = face_detection.process(rgb_frame)
+                        mesh_results = (
+                            face_mesh.process(rgb_frame)
+                            if face_results.detections
+                            else None
+                        )
+                        mesh_faces = (
+                            list(mesh_results.multi_face_landmarks)
+                            if mesh_results and mesh_results.multi_face_landmarks
+                            else []
+                        )
+
+                        if face_results.detections:
+                            # Use the highest-confidence face as our signal.
+                            best_det = max(
+                                face_results.detections,
+                                key=lambda det: float(det.score[0]),
                             )
-                            faces_in_guide = 0
-                            faces_outside_guide = 0
+                            det_bbox = best_det.location_data.relative_bounding_box
+                            _fx = int(det_bbox.xmin * frame_width)
+                            _fy = int(det_bbox.ymin * frame_height)
+                            _fw = int(det_bbox.width * frame_width)
+                            _fh = int(det_bbox.height * frame_height)
+                            has_face = True
+                            face_confidence = float(best_det.score[0])
 
-                            has_face = False
-                            has_frontal_face = False
-                            face_confidence = 0.0
+                            # Frontal check when mesh is available.
+                            if mesh_faces:
+                                try:
+                                    if is_face_looking_at_camera(
+                                        mesh_faces[0], frame_width, frame_height
+                                    ):
+                                        has_frontal_face = True
+                                except Exception:
+                                    pass
 
-                            # Process face mesh once for all faces
-                            mesh_results = (
-                                face_mesh.process(rgb_frame)
-                                if face_results.detections
-                                else None
-                            )
-                            mesh_faces = (
-                                list(mesh_results.multi_face_landmarks)
-                                if mesh_results and mesh_results.multi_face_landmarks
-                                else []
-                            )
+                        # Base score from motion and sharpness.
+                        frame_area = frame_width * frame_height
+                        area_score = (area / frame_area) * 0.5
+                        sharp_score = (sharpness_score / 500.0) * 0.2
 
-                            if face_results.detections:
-                                # Count faces in guide vs outside guide
-                                for idx, det in enumerate(face_results.detections):
-                                    bbox = det.location_data.relative_bounding_box
-                                    face_x = int(bbox.xmin * frame_width)
-                                    face_y = int(bbox.ymin * frame_height)
-                                    face_w = int(bbox.width * frame_width)
-                                    face_h = int(bbox.height * frame_height)
+                        # Face bonuses and priority tiers (no obstruction tier now):
+                        #   3: Person + frontal face
+                        #   2: Person + non-frontal face
+                        #   1: Person-only (no face)
+                        face_bonus = 0.0
+                        priority_level = 1
+                        if has_frontal_face:
+                            priority_level = 3
+                            face_bonus = 0.7
+                        elif has_face:
+                            priority_level = 2
+                            face_bonus = 0.4
+                        score = area_score + sharp_score + face_bonus
 
-                                    face_in_guide = is_in_guide_region(
-                                        (face_x, face_y, face_w, face_h),
-                                        frame_width,
-                                        frame_height,
-                                        guide_region_width_ratio,
-                                        guide_region_height_ratio,
-                                    )
-
-                                    if face_in_guide:
-                                        faces_in_guide += 1
-                                    else:
-                                        faces_outside_guide += 1
-                                        # This face is outside guide region - mark as detected
-                                        has_face = True
-                                        det_confidence = float(det.score[0])
-
-                                        # Check if this face is frontal using face mesh
-                                        if mesh_faces:
-                                            lm_index = (
-                                                idx if idx < len(mesh_faces) else 0
-                                            )
-                                            try:
-                                                if is_face_looking_at_camera(
-                                                    mesh_faces[lm_index],
-                                                    frame_width,
-                                                    frame_height,
-                                                ):
-                                                    # Found a frontal face - this is the best candidate
-                                                    has_frontal_face = True
-                                                    face_confidence = det_confidence
-                                                    # Don't break - continue checking to see if there's an even better one
-                                            except Exception:
-                                                # If mesh-based frontal check fails, keep this as non-frontal
-                                                if not has_frontal_face:
-                                                    face_confidence = max(
-                                                        face_confidence, det_confidence
-                                                    )
-                                        else:
-                                            # No mesh results, but we have a face
-                                            if not has_frontal_face:
-                                                face_confidence = max(
-                                                    face_confidence, det_confidence
-                                                )
-
-                            # Check if person is in guide region
-                            person_in_guide = is_in_guide_region(
-                                (x, y, w, h),
-                                frame_width,
-                                frame_height,
-                                guide_region_width_ratio,
-                                guide_region_height_ratio,
-                            )
-
-                            # Calculate person size ratios to determine if someone is close
-                            person_width_ratio_temp = w / float(frame_width)
-                            frame_area_temp = frame_width * frame_height
-                            area_ratio_temp = area / float(frame_area_temp)
-
-                            # Allow if:
-                            # 1. Person is outside guide region (normal case - rider detected), OR
-                            # 2. Person is in guide region BUT:
-                            #    a) 2+ faces detected (both guide and rider visible), OR
-                            #    b) Person detection is LARGE (indicating someone is close, even if only 1 face detected)
-                            #       - Large = width >= 30% OR area >= 8% (much larger than minimum thresholds)
-                            #       - This handles cases where rider is visible but face is too small to detect
-                            is_large_person = (
-                                person_width_ratio_temp >= 0.30
-                                or area_ratio_temp >= 0.08
-                            )
-                            allow_capture = not person_in_guide or (
-                                person_in_guide
-                                and (total_face_count >= 2 or is_large_person)
-                            )
-
-                            if not allow_capture:
-                                # Person is in guide region and it's likely just the guide (no rider visible - only 0-1 faces)
-                                rejected_reason = "guide_only"
-                                if show_progress:
-                                    print(
-                                        f"Frame {frame_count} (t={frame_time:.2f}s): REJECTED - {rejected_reason} | "
-                                        f"Person in guide region, but only {total_face_count} face(s) detected "
-                                        f"(need 2+ to confirm rider is present)"
-                                    )
-                                last_detection_info = {
-                                    "bbox": (x, y, w, h),
-                                    "has_face": has_face,
-                                    "is_frontal": has_frontal_face,
-                                    "sharpness": sharpness_score,
-                                    "score": 0.0,
-                                    "area": area,
-                                    "rejected": rejected_reason,
-                                }
-                                continue
-
-                            # Person passed guide region check - continue with processing
-
-                            # Before accepting a person‑only detection, make sure
-                            # the rider is not still tiny/far away and is in the
-                            # expected region of the frame (right‑hand side).
-                            # We use on‑screen width, overall area and horizontal
-                            # position as proxies for distance/quality.
-                            person_width_ratio = w / float(frame_width)
-                            frame_area = frame_width * frame_height
-                            area_ratio = area / float(frame_area)
-                            person_center_x = x + w / 2.0
-
-                            # Check for obstructions (hand, object blocking camera)
-                            # Near the end of video, be more aggressive even if face is detected
-                            # because guide's hand might be part of the detection
-                            is_near_end = False
-                            if start_time is not None and end_time is not None:
-                                segment_duration = end_time - start_time
-                                if segment_duration > 0:
-                                    time_in_segment = frame_time - start_time
-                                    segment_ratio = time_in_segment / segment_duration
-                                    is_near_end = (
-                                        segment_ratio
-                                        >= COMING_OBSTRUCTION_CHECK_END_RATIO
-                                    )
-
-                            # Check for obstructions:
-                            # - Always check if no face detected
-                            # - Also check if near end of video (last 15%) even with face, because guide's hand might be in the detection
-                            has_obstruction_flag = False
-                            if not has_face or is_near_end:
-                                # Check for obstructions, passing bbox for position-based checks
-                                has_obstruction_flag = has_obstruction(
-                                    area,
-                                    w,
-                                    h,
-                                    frame_width,
-                                    frame_height,
-                                    frame_time,
-                                    start_time,
-                                    end_time,
-                                    bbox=(x, y, w, h),
-                                )
-                            # If face is detected and NOT near end, large bounding box is valid (multiple people close together)
-
-                            # Base score from motion and sharpness.
-                            area_score = (area / (frame_width * frame_height)) * 0.5
-                            sharp_score = (sharpness_score / 500.0) * 0.2
-
-                            # Face bonuses and priority tiers:
-                            #   3: Person + frontal face
-                            #   2: Person + non-frontal face
-                            #   1: Person-only (no face)
-                            #   0: Obstruction (hand/object blocking camera) - WORST TIER
-                            face_bonus = 0.0
-                            priority_level = 1
-                            if has_obstruction_flag:
-                                priority_level = 0  # Lowest tier for obstructions
-                                # Reduce score significantly for obstructions
-                                score = (
-                                    area_score * 0.1 + sharp_score * 0.1
-                                )  # Very low score
-                            else:
-                                if has_frontal_face:
-                                    priority_level = 3
-                                    face_bonus = 0.7
-                                elif has_face:
-                                    priority_level = 2
-                                    face_bonus = 0.4
-                                score = area_score + sharp_score + face_bonus
-
-                            # Apply size and region checks, but be more lenient when faces are detected.
-                            # Face detection is a strong signal that a valid person is present.
-                            # When multiple people are close together, the person detection box might be large
-                            # and the center_x might be in the left half, but if faces are detected, it's valid.
-                            # Reject if:
-                            #   - the blob is still very small on screen (even with face), OR
-                            #   - the blob sits too far to the left AND no face detected (valley / trees)
-                            # Note: Guide region check already done above (allows if both guide+rider visible)
-
-                            # If face is detected, relax the center_x check (person box might encompass both guide and rider)
-                            # But still enforce minimum size to avoid very distant persons
-                            min_center_x_ratio = COMING_MIN_PERSON_CENTER_X_RATIO
-                            if has_face or total_face_count >= 2:
-                                # With face detection, allow center_x to be anywhere (person box might be large)
-                                min_center_x_ratio = 0.0  # No center_x restriction when faces are present
-
-                            if (
-                                person_width_ratio
-                                < COMING_MIN_PERSON_WIDTH_RATIO_NO_FACE
-                                or area_ratio < COMING_MIN_PERSON_AREA_RATIO_NO_FACE
-                                or (person_center_x < frame_width * min_center_x_ratio)
-                            ):
-                                if (
-                                    person_center_x
-                                    < frame_width * COMING_MIN_PERSON_CENTER_X_RATIO
-                                ):
-                                    rejected_reason = "wrong_region"
-                                elif (
-                                    person_width_ratio
-                                    < COMING_MIN_PERSON_WIDTH_RATIO_NO_FACE
-                                    or area_ratio < COMING_MIN_PERSON_AREA_RATIO_NO_FACE
-                                ):
-                                    rejected_reason = "too_small"
-                                else:
-                                    rejected_reason = "rejected"
-
-                                # Debug logging to help diagnose why candidates are rejected
-                                if (
-                                    show_progress and frame_count % (fps * 2) == 0
-                                ):  # Every 2 seconds
-                                    print(
-                                        f"Frame {frame_count} (t={frame_time:.2f}s): REJECTED - {rejected_reason} | "
-                                        f"width_ratio={person_width_ratio:.3f} (min={COMING_MIN_PERSON_WIDTH_RATIO_NO_FACE:.3f}), "
-                                        f"area_ratio={area_ratio:.3f} (min={COMING_MIN_PERSON_AREA_RATIO_NO_FACE:.3f}), "
-                                        f"center_x_ratio={person_center_x / frame_width:.3f} (min={COMING_MIN_PERSON_CENTER_X_RATIO:.3f}), "
-                                        f"faces_total={total_face_count}, faces_outside_guide={faces_outside_guide}"
-                                    )
-
-                                last_detection_info = {
-                                    "bbox": (x, y, w, h),
-                                    "has_face": has_face,
-                                    "is_frontal": has_frontal_face,
-                                    "sharpness": sharpness_score,
-                                    "score": score,
-                                    "area": area,
-                                    "rejected": rejected_reason,
-                                }
-                                continue
-
-                            # Enforce detection area: only keep as candidate if person
-                            # is inside the configured region.
-                            if not _bbox_in_detection_area((x, y, w, h)):
-                                if show_progress:
-                                    print(
-                                        f"[capture][coming] frame={frame_count} "
-                                        f"time={frame_time:.3f}s bbox=({x},{y},{w},{h}) "
-                                        f"-> REJECTED (outside detection_area)"
-                                    )
-                                last_detection_info = {
-                                    "bbox": (x, y, w, h),
-                                    "has_face": has_face,
-                                    "is_frontal": has_frontal_face,
-                                    "sharpness": sharpness_score,
-                                    "score": 0.0,
-                                    "area": area,
-                                    "rejected": "outside_detection_area",
-                                }
-                                continue
-
-                            candidate_frames.append(
-                                {
-                                    "frame": frame.copy(),
-                                    "frame_count": frame_count,
-                                    "time": frame_time,
-                                    "score": score,
-                                    "priority_level": priority_level,
-                                    "sharpness": sharpness_score,
-                                    "has_face": has_face,
-                                    "is_frontal": has_frontal_face,
-                                    "face_confidence": face_confidence,
-                                    "bbox": (x, y, w, h),
-                                    "area": area,  # Store area for selection prioritization
-                                    "has_obstruction": has_obstruction_flag,  # Mark if obstruction detected
-                                }
-                            )
-
-                            # Debug logging when candidate is accepted
+                        # Enforce detection area: only keep as candidate if person
+                        # is inside the configured region.
+                        if not _bbox_in_detection_area((x, y, w, h)):
                             if show_progress:
-                                obstruction_text = (
-                                    " (OBSTRUCTION)" if has_obstruction_flag else ""
-                                )
                                 print(
-                                    f"Frame {frame_count} (t={frame_time:.2f}s): ACCEPTED{obstruction_text} | "
-                                    f"Tier={priority_level}, width_ratio={person_width_ratio:.3f}, "
-                                    f"area_ratio={area_ratio:.3f}, has_face={has_face}, frontal={has_frontal_face}"
+                                    f"[capture][coming] frame={frame_count} "
+                                    f"time={frame_time:.3f}s bbox=({x},{y},{w},{h}) "
+                                    f"-> REJECTED (outside detection_area)"
                                 )
-
-                            # Store detection info for visualization
                             last_detection_info = {
                                 "bbox": (x, y, w, h),
                                 "has_face": has_face,
                                 "is_frontal": has_frontal_face,
-                                "face_confidence": face_confidence,
                                 "sharpness": sharpness_score,
-                                "score": score,
+                                "score": 0.0,
                                 "area": area,
-                                "rejected": None,
-                                "priority_level": priority_level,
-                                "has_obstruction": has_obstruction_flag,
+                                "rejected": "outside_detection_area",
                             }
+                            continue
 
-                            # Found a valid person - break out of contour loop
-                            person_found = True
-                            break
+                        candidate_frames.append(
+                            {
+                                "frame": frame.copy(),
+                                "frame_count": frame_count,
+                                "time": frame_time,
+                                "score": score,
+                                "priority_level": priority_level,
+                                "sharpness": sharpness_score,
+                                "has_face": has_face,
+                                "is_frontal": has_frontal_face,
+                                "face_confidence": face_confidence,
+                                "bbox": (x, y, w, h),
+                                "area": area,
+                            }
+                        )
+
+                        # Store detection info for visualization.
+                        last_detection_info = {
+                            "bbox": (x, y, w, h),
+                            "has_face": has_face,
+                            "is_frontal": has_frontal_face,
+                            "face_confidence": face_confidence,
+                            "sharpness": sharpness_score,
+                            "score": score,
+                            "area": area,
+                            "rejected": None,
+                            "priority_level": priority_level,
+                        }
+
+                        # Found a valid person - break out of contour loop.
+                        person_found = True
+                        break
 
                     # If no valid person found in any contour, show that we tried
                     if not person_found:
@@ -2201,81 +1946,9 @@ def capture_images_from_video(
                     )
 
             elif mode == "coming":
-                # Draw person detection and guide region
-                # Draw guide region (bottom left)
-                cv2.rectangle(
-                    display_frame,
-                    (0, guide_region_y_start_px),
-                    (guide_region_width_px, frame_height),
-                    (0, 0, 255),
-                    2,
-                )
-                cv2.putText(
-                    display_frame,
-                    "Guide Region",
-                    (10, guide_region_y_start_px + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 0, 255),
-                    2,
-                )
-
-                # Draw face detections for visualization (even if not in last_detection_info)
-                face_results_viz = face_detection.process(rgb_frame)
-                if face_results_viz and face_results_viz.detections:
-                    for det in face_results_viz.detections:
-                        bbox = det.location_data.relative_bounding_box
-                        face_x = int(bbox.xmin * frame_width)
-                        face_y = int(bbox.ymin * frame_height)
-                        face_w = int(bbox.width * frame_width)
-                        face_h = int(bbox.height * frame_height)
-
-                        # Only draw faces outside guide region
-                        if not is_in_guide_region(
-                            (face_x, face_y, face_w, face_h),
-                            frame_width,
-                            frame_height,
-                            guide_region_width_ratio,
-                            guide_region_height_ratio,
-                        ):
-                            # Check if frontal using face mesh
-                            is_frontal_viz = False
-                            if face_mesh:
-                                mesh_results_viz = face_mesh.process(rgb_frame)
-                                if (
-                                    mesh_results_viz
-                                    and mesh_results_viz.multi_face_landmarks
-                                ):
-                                    try:
-                                        is_frontal_viz = is_face_looking_at_camera(
-                                            mesh_results_viz.multi_face_landmarks[0],
-                                            frame_width,
-                                            frame_height,
-                                        )
-                                    except Exception:
-                                        pass
-
-                            # Color: green for frontal, yellow for non-frontal
-                            face_color = (
-                                (0, 255, 0) if is_frontal_viz else (0, 255, 255)
-                            )
-                            cv2.rectangle(
-                                display_frame,
-                                (face_x, face_y),
-                                (face_x + face_w, face_y + face_h),
-                                face_color,
-                                2,
-                            )
-                            face_label = "Face (Frontal)" if is_frontal_viz else "Face"
-                            cv2.putText(
-                                display_frame,
-                                face_label,
-                                (face_x, face_y - 5),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.5,
-                                face_color,
-                                2,
-                            )
+                # COMING MODE visualization:
+                # - Only draw boxes for the person/face candidate contained in the
+                #   configured detection_area (same bbox as used for scoring).
 
                 if last_detection_info:
                     x, y, w, h = last_detection_info["bbox"]
@@ -2290,26 +1963,13 @@ def capture_images_from_video(
                     color = (0, 255, 0) if rejected_reason is None else (0, 0, 255)
                     cv2.rectangle(display_frame, (x, y), (x + w, y + h), color, 3)
 
-                    # Draw label
-                    has_obstruction_viz = last_detection_info.get(
-                        "has_obstruction", False
-                    )
-                    if rejected_reason == "guide_only":
-                        label = "Guide (filtered)"
-                    elif rejected_reason == "too_small":
-                        label = "Person (too small)"
-                    elif rejected_reason == "wrong_region":
-                        label = "Person (wrong region)"
-                    elif has_obstruction_viz:
-                        label = "Person (OBSTRUCTION - Tier 0)"
-                        color = (0, 165, 255)  # Orange color for obstructions
+                    # Draw label (simple tier-based labelling)
+                    if is_frontal:
+                        label = "Person (Tier 3: Frontal Face)"
+                    elif has_face:
+                        label = "Person (Tier 2: Face)"
                     else:
-                        if is_frontal:
-                            label = "Person (Frontal Face)"
-                        elif has_face:
-                            label = "Person (Face)"
-                        else:
-                            label = "Person (No Face)"
+                        label = "Person (Tier 1: No Face)"
                     cv2.putText(
                         display_frame,
                         label,
@@ -2722,9 +2382,9 @@ def capture_images_from_video(
             # For other modes (going, group): prioritize tier first, then score, then area
             return (priority, score, area)
 
-    # For coming/bridge modes: Filter out obstructions (Tier 0) BEFORE sorting
-    # Obstructions should never be selected, even if they have large area
-    if mode in ["coming", "bridge"]:
+    # For BRIDGE mode only: Filter out obstructions (Tier 0) BEFORE sorting.
+    # Coming mode  uses relies on detection_area instead.
+    if mode == "bridge":
         candidate_frames = [
             c for c in candidate_frames if c.get("priority_level", 1) != 0
         ]
@@ -2732,7 +2392,7 @@ def capture_images_from_video(
             # If all candidates were obstructions, we have a problem
             return {
                 "success": False,
-                "error": "Only found obstructions (hand/object blocking camera) in all candidate frames. No valid person detections.",
+                "error": "Only found obstructions (hand/object blocking camera) in all candidate frames for bridge mode. No valid person detections.",
             }
 
     candidate_frames.sort(key=sort_key, reverse=True)
@@ -2969,11 +2629,12 @@ def capture_images_from_video(
         error_msg = f"Only found {len(selected_frames)} valid frames with minimum delay of {min_delay_seconds}s, "
         error_msg += f"but {min_pictures} required. "
         if len(candidate_frames) == 0:
-            error_msg += "No candidates were found - this may indicate: "
-            error_msg += f"(1) Person never reached minimum size (width >= {COMING_MIN_PERSON_WIDTH_RATIO_NO_FACE * 100:.0f}%, "
-            error_msg += f"area >= {COMING_MIN_PERSON_AREA_RATIO_NO_FACE * 100:.1f}%), "
-            error_msg += f"(2) Person was always in wrong region (center_x < {COMING_MIN_PERSON_CENTER_X_RATIO * 100:.0f}% of frame), "
-            error_msg += "or (3) Person was always in guide region. Try running with show_frames=True to see detection status."
+            error_msg += (
+                "No candidates were found inside the active detection area. "
+                "This usually means the person never produced a large/enough motion blob "
+                "inside that region (or all frames were too blurry). "
+                "Try running with show_frames=True to visualise the detection_area and motion."
+            )
         else:
             error_msg += f"Found {len(candidate_frames)} candidates but none met the min_delay_seconds requirement."
         return {
@@ -3022,9 +2683,8 @@ def capture_images_from_video(
 
 
 if __name__ == "__main__":
-    # Example usage - modify video_path and platform_number as needed.
-    # Here we also hard-code a polygonal detection_area (normalised 0–1 coords)
-    # so you can visually verify the region and behaviour.
+    
+    # hard-code a polygonal detection_area (normalised 0–1 coords)
     detection_polygon_norm = [
         [0.23381371110709173, 0.018615942389573526],
         [0.2757205818855924, 0.36068185210987264],
