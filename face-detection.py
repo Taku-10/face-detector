@@ -7,9 +7,101 @@ returning the start and end timestamps for that segment.
 
 import cv2
 import mediapipe as mp
+import urllib.request
 from typing import Optional, Dict, Any, List, Sequence
 import os
 from pathlib import Path
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# MediaPipe 0.10+ compatibility shim
+# The old mp.solutions.face_detection API was removed in 0.10.
+# ---------------------------------------------------------------------------
+
+class _RelativeBoundingBox:
+    def __init__(self, xmin, ymin, width, height):
+        self.xmin = xmin
+        self.ymin = ymin
+        self.width = width
+        self.height = height
+
+
+class _RelativeKeypoint:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+
+class _LocationData:
+    def __init__(self, relative_bounding_box, relative_keypoints):
+        self.relative_bounding_box = relative_bounding_box
+        self.relative_keypoints = relative_keypoints
+
+
+class _Detection:
+    def __init__(self, location_data, score):
+        self.location_data = location_data
+        self.score = [score]
+
+
+class _DetectionResult:
+    def __init__(self, detections):
+        self.detections = detections
+
+
+class FaceDetectionCompat:
+    """Wraps MediaPipe Tasks FaceDetector (0.10+) to match the old solutions API."""
+
+    _MODEL_URL = (
+        "https://storage.googleapis.com/mediapipe-models/face_detector/"
+        "blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
+    )
+    _MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blaze_face_short_range.tflite")
+
+    def __init__(self, model_selection=0, min_detection_confidence=0.5):
+        self._ensure_model()
+        base_options = mp.tasks.BaseOptions(model_asset_path=self._MODEL_PATH)
+        options = mp.tasks.vision.FaceDetectorOptions(
+            base_options=base_options,
+            min_detection_confidence=min_detection_confidence,
+        )
+        self._detector = mp.tasks.vision.FaceDetector.create_from_options(options)
+
+    def _ensure_model(self):
+        if not os.path.exists(self._MODEL_PATH):
+            import ssl
+            print("Downloading MediaPipe face detection model...", flush=True)
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with urllib.request.urlopen(self._MODEL_URL, context=ctx) as response:
+                with open(self._MODEL_PATH, "wb") as f:
+                    f.write(response.read())
+
+    def process(self, rgb_frame):
+        h, w = rgb_frame.shape[:2]
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        result = self._detector.detect(mp_image)
+        compat_detections = []
+        for det in result.detections:
+            bb = det.bounding_box
+            rel_bbox = _RelativeBoundingBox(
+                xmin=bb.origin_x / w,
+                ymin=bb.origin_y / h,
+                width=bb.width / w,
+                height=bb.height / h,
+            )
+            rel_keypoints = [_RelativeKeypoint(kp.x, kp.y) for kp in det.keypoints]
+            score = det.categories[0].score if det.categories else 0.0
+            compat_detections.append(_Detection(_LocationData(rel_bbox, rel_keypoints), score))
+        return _DetectionResult(compat_detections)
+
+    def close(self):
+        self._detector.close()
+
+
+# ---------------------------------------------------------------------------
 
 # Optional: YOLOv8 pose for multi-person kitting
 try:
@@ -21,9 +113,12 @@ except ImportError:
 
 
 try:
-    from capture_images import capture_images_from_video
+    from .capture_images import capture_images_from_video
 except ImportError:
-    capture_images_from_video = None
+    try:
+        from capture_images import capture_images_from_video
+    except ImportError:
+        capture_images_from_video = None
 
 
 def _add_image_capture_to_result(
@@ -42,15 +137,15 @@ def _add_image_capture_to_result(
     show_frames: bool,
     capture_offset_after_start: Optional[float],
     capture_offset_before_end: Optional[float],
+    capture_images_output_dir: Optional[str] = None,
+    filename_prefix: Optional[str] = None,
 ) -> dict:
     """Helper function to add image capture results to detection result."""
-    if (
-        capture_images
-        and result.get("valid", False)
-        and segment_start_time is not None
-        and segment_end_time is not None
-        and capture_images_from_video is not None
-    ):
+    # Capture images regardless of whether AI detection succeeded or failed.
+    # For most directions we use the detected (trimmed) segment; for WALKING+BRIDGE
+    # we intentionally ignore the trim and let the image capture pipeline look at
+    # the tail of the FULL video instead (last 5 seconds of the raw file).
+    if capture_images and capture_images_from_video is not None:
         # Determine capture mode
         capture_mode = capture_images_mode
         if capture_mode is None:
@@ -59,10 +154,66 @@ def _add_image_capture_to_result(
                 capture_mode = "coming"
             elif direction == "going":
                 capture_mode = "going"
+            elif direction == "swimming":
+                capture_mode = "swimming"
             elif direction in ["walking", "kitting", "sitting"]:
                 capture_mode = "group"
             else:
                 capture_mode = "going"  # Default
+
+        # Decide the time range we pass into capture_images_from_video:
+        # - Normal case: use the detected segment [segment_start_time, segment_end_time]
+        # - Special case for WALKING + BRIDGE capture:
+        #     Let the capture pipeline itself decide the last 5 seconds of the FULL video
+        #     by passing no explicit time range.
+        capture_start = segment_start_time
+        capture_end = segment_end_time
+
+        if direction == "walking" and capture_mode == "bridge":
+            capture_start = None
+            capture_end = None
+
+        # DEBUG: Log image capture parameters
+        print(f"DEBUG face_detection_core - About to call capture_images_from_video:")
+        print(f"  - mode={capture_mode}")
+        print(
+            f"  - min_pictures={capture_images_min}, max_pictures={capture_images_max}"
+        )
+        print(f"  - output_dir={capture_images_output_dir}")
+        print(f"  - start_time={capture_start}, end_time={capture_end}")
+
+        platform_4_detection_polygon_norm = [
+            [0.006319269738088148, 0.09837224258342564],
+            [0.3964522810331776, 0.10900641594260593],
+            [0.6329267661404313, 0.14445366047320687],
+            [0.7666296395766001, 0.27206374078337026],
+            [0.8564300769591016, 0.4085356322261839],
+            [0.9083147741134356, 0.6194467371832595],
+            [0.8913524692745187, 0.715154297415882],
+            [0.8384699894826012, 0.8533985510852257],
+            [0.7436806389121831, 0.9260654023729576],
+            [0.5770509384357638, 0.9579679224504984],
+            [0.509201719080096, 0.9845533558484492],
+            [0.2847006256238425, 0.975691544715799],
+            [0.18991127505342437, 0.9455613868647882],
+            [0.13902436053667358, 0.826813117687275],
+            [0.11906870778500658, 0.677934690658751],
+            [0.12106427306017328, 0.5786824059730684],
+            [0.10609753349642305, 0.43689342785066465],
+            [0.06419066271792238, 0.32168988312621155],
+        ]
+
+        platform_9_detection_polygon_norm = [
+            [0.2477826680332586, 0.2826979141425505],
+            [0.36951214981842717, 0.715154297415882],
+            [0.39545449839559427, 0.8339025665933952],
+            [0.592017677999514, 0.9615126469035585],
+            [0.7516629000128499, 0.9526508357709084],
+            [0.7566518132007666, 0.8161789443280947],
+            [0.7147449424222659, 0.6797070528852811],
+            [0.5800442863485138, 0.5432351614424674],
+            [0.4583148045633452, 0.41916980558536415],
+        ]
 
         # Capture images from the detected segment
         capture_result = capture_images_from_video(
@@ -72,39 +223,47 @@ def _add_image_capture_to_result(
             max_pictures=capture_images_max,
             min_delay_seconds=capture_images_min_delay,
             platform_number=platform_number,
-            start_time=segment_start_time,
-            end_time=segment_end_time,
+            start_time=capture_start,
+            end_time=capture_end,
             show_progress=show_progress,
             show_frames=show_frames,
-        )
-        additional_captures = _capture_specific_offsets(
-            input_video_path,
-            segment_start_time,
-            segment_end_time,
-            capture_offset_after_start,
-            capture_offset_before_end,
-            capture_result.get("output_dir")
-            if isinstance(capture_result, dict)
-            else None,
+            output_dir=capture_images_output_dir,
+            filename_prefix=filename_prefix,
+            detection_area=platform_4_detection_polygon_norm,
         )
 
+        additional_captures: List[str] = []
+
+        # If we have a structured result, we can respect capture_images_max
+        # when deciding whether to take extra offset-based captures.
         if isinstance(capture_result, dict):
-            # Ensure captured_files + extra_captures stay within min/max bounds
             captured_files = capture_result.get("captured_files", []) or []
+
+            if capture_images_max is not None:
+                # How many extra images we are allowed to add
+                remaining_slots = max(0, capture_images_max - len(captured_files))
+            else:
+                remaining_slots = None
+
+            # Only capture offset-based images if we have remaining slots
+            if remaining_slots is None or remaining_slots > 0:
+                print(
+                    f"DEBUG face_detection_core - capture_images_from_video returned: {capture_result}"
+                )
+                additional_captures = _capture_specific_offsets(
+                    input_video_path,
+                    segment_start_time,
+                    segment_end_time,
+                    capture_offset_after_start,
+                    capture_offset_before_end,
+                    capture_result.get("output_dir"),
+                    filename_prefix,
+                    remaining_slots,
+                )
+
             extra_files = additional_captures or []
 
-            # If we have a max images setting, reserve space for extra captures
-            if capture_images_max is not None:
-                max_total = capture_images_max
-                # How many slots remain for the main captured_files after extras
-                allowed_main = max_total - len(extra_files)
-                if allowed_main < 0:
-                    allowed_main = 0
-                if len(captured_files) > allowed_main:
-                    captured_files = captured_files[:allowed_main]
-                    capture_result["captured_files"] = captured_files
-
-            # Recompute images_captured as main + extras
+            # Recompute images_captured as main + extras (both are <= max if set)
             total_captured = len(captured_files) + len(extra_files)
             capture_result["images_captured"] = total_captured
 
@@ -137,6 +296,8 @@ def _capture_specific_offsets(
     offset_after_start: Optional[float],
     offset_before_end: Optional[float],
     base_output_dir: Optional[str],
+    filename_prefix: Optional[str] = None,
+    max_captures: Optional[int] = None,
 ) -> List[str]:
     if segment_start_time is None or segment_end_time is None:
         return []
@@ -162,20 +323,37 @@ def _capture_specific_offsets(
     os.makedirs(output_dir, exist_ok=True)
 
     captured_files: List[str] = []
+
+    # Helper to check if we have reached the maximum number of extra captures
+    def can_capture_more() -> bool:
+        return max_captures is None or len(captured_files) < max_captures
+
     if safe_after is not None:
+        if not can_capture_more():
+            return captured_files
         target_time = segment_start_time + safe_after
         if target_time < segment_end_time:
             captured = _capture_frame_at_time(
-                video_path, target_time, output_dir, f"after_start_{safe_after:.2f}"
+                video_path,
+                target_time,
+                output_dir,
+                f"after_start_{safe_after:.2f}",
+                filename_prefix,
             )
             if captured:
                 captured_files.append(captured)
 
     if safe_before is not None:
+        if not can_capture_more():
+            return captured_files
         target_time = segment_end_time - safe_before
         if target_time > segment_start_time:
             captured = _capture_frame_at_time(
-                video_path, target_time, output_dir, f"before_end_{safe_before:.2f}"
+                video_path,
+                target_time,
+                output_dir,
+                f"before_end_{safe_before:.2f}",
+                filename_prefix,
             )
             if captured:
                 captured_files.append(captured)
@@ -188,6 +366,7 @@ def _capture_frame_at_time(
     time_seconds: float,
     output_dir: str,
     label: str,
+    filename_prefix: Optional[str] = None,
 ) -> Optional[str]:
     if time_seconds < 0:
         return None
@@ -203,7 +382,11 @@ def _capture_frame_at_time(
     if not ret or frame is None:
         return None
 
-    filename = f"extra_{label}_t{time_seconds:.2f}s.jpg"
+    # Add prefix to filename to prevent cleanup conflicts between scenes
+    if filename_prefix:
+        filename = f"{filename_prefix}_extra_{label}_t{time_seconds:.2f}s.jpg"
+    else:
+        filename = f"extra_{label}_t{time_seconds:.2f}s.jpg"
     filepath = os.path.join(output_dir, filename)
     cv2.imwrite(filepath, frame)
     return filepath
@@ -309,6 +492,14 @@ def trim_video(
             cap.release()
             return False
 
+        actual_video_duration = total_frames / fps
+        end_time_used = end_time < actual_video_duration
+        print(
+            f"  [trim_video] actual video duration: {actual_video_duration:.2f}s | "
+            f"trim range: {start_time:.2f}s -> {end_time:.2f}s | "
+            f"end_time used (clips before video end): {end_time_used}"
+        )
+
         # Calculate frame numbers for start and end
         start_frame = int(start_time * fps)
         end_frame = int(end_time * fps)
@@ -366,7 +557,7 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "capture_images": True,
         "capture_images_mode": "going",
         "capture_images_min": 1,
-        "capture_images_max": 5,
+        "capture_images_max": 2,
         "capture_images_min_delay": 2.0,
         "capture_offset_after_start": 2.5,
         "capture_offset_before_end": 1.0,
@@ -376,13 +567,13 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "min_duration": 5.0,
         "max_duration": 10.0,
         "ideal_duration": 8.0,
-        "end_trim_seconds": 1.0,
+        "end_trim_seconds": 2.0,
         "backward_extension_seconds": 2.0,
         "start_offset_seconds": 0.0,
         "capture_images": True,
         "capture_images_mode": "coming",
         "capture_images_min": 1,
-        "capture_images_max": 5,
+        "capture_images_max": 1,
         "capture_images_min_delay": 2.0,
         "capture_offset_after_start": 2.5,
         "capture_offset_before_end": 2.5,
@@ -397,9 +588,9 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "is_walking": True,
         "start_offset_seconds": 0.0,
         "capture_images": True,
-        "capture_images_mode": "group",
+        "capture_images_mode": "bridge",
         "capture_images_min": 1,
-        "capture_images_max": 5,
+        "capture_images_max": 1,
         "capture_images_min_delay": 2.0,
         "capture_offset_after_start": 1.5,
         "capture_offset_before_end": 2,
@@ -436,6 +627,22 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "capture_offset_after_start": None,
         "capture_offset_before_end": None,
     },
+    6: {
+        "direction": "swimming",
+        "min_duration": 6.0,
+        "max_duration": 20.0,
+        "ideal_duration": 12.0,
+        "end_trim_seconds": 0.5,
+        "backward_extension_seconds": 2.0,
+        "start_offset_seconds": 0.0,
+        "capture_images": True,
+        "capture_images_mode": "swimming",
+        "capture_images_min": 3,
+        "capture_images_max": 8,
+        "capture_images_min_delay": 1.5,
+        "capture_offset_after_start": 1.5,
+        "capture_offset_before_end": 1.5,
+    },
 }
 
 
@@ -461,13 +668,15 @@ def detect_zipline_segment(
     capture_images_min_delay: Optional[float] = None,
     capture_offset_after_start: Optional[float] = None,
     capture_offset_before_end: Optional[float] = None,
+    capture_images_output_dir: Optional[str] = None,
+    filename_prefix: Optional[str] = None,
 ) -> dict:
     """
     Detects the visible time range of a zipline rider in the video.
 
     Args:
         input_video_path: Path to the raw video file
-        direction: Either "coming", "going", "walking", "kitting", or "sitting" (detection mode)
+        direction: Either "coming", "going", "walking", "kitting", "sitting", or "swimming" (detection mode)
             - If None and platform_number is provided, uses platform's direction
             - If None and platform_number is not provided, defaults to "coming"
         min_duration: Minimum motion duration to be considered valid (seconds)
@@ -508,7 +717,7 @@ def detect_zipline_segment(
             - If platform_number is provided and this is None, uses the platform's configured start_offset_seconds
         capture_images: Optional bool to enable image capture within the detected window
             - If None, defers to the platform configuration (default False)
-        capture_images_mode: Optional capture mode override ("going", "coming", "group")
+        capture_images_mode: Optional capture mode override ("going", "coming", "group", "swimming", "bridge")
             - If None, uses platform configuration, then falls back to detection direction
         capture_images_min / capture_images_max: Optional overrides for number of images to capture
             - If None, use platform configuration when available
@@ -708,12 +917,12 @@ def detect_zipline_segment(
         trim_output_path = os.path.join(output_videos_dir, output_filename)
 
     # Validate inputs
-    if direction not in ["coming", "going", "walking", "kitting", "sitting"]:
+    if direction not in ["coming", "going", "walking", "kitting", "sitting", "swimming"]:
         return {
             "input_video": input_video_path,
             "direction": direction,
             "valid": False,
-            "reason": f"Invalid direction: {direction}. Must be 'coming', 'going', 'walking', 'kitting', or 'sitting'",
+            "reason": f"Invalid direction: {direction}. Must be 'coming', 'going', 'walking', 'kitting', 'sitting', or 'swimming'",
             "platform_number": platform_number,
         }
 
@@ -761,8 +970,8 @@ def detect_zipline_segment(
                 output_video_path, fourcc, fps, (frame_width, frame_height)
             )
 
-        if direction == "coming":
-            # For "coming": rider comes from higher platform down to lower platform (camera position)
+        if direction in ["coming", "swimming"]:
+            # For "coming"/"swimming": detect entry with motion and refine with face cues when available.
             # Strategy:
             # - Start = first person detection (rider entering frame)
             # - End = last face detection (rider looking at camera)
@@ -774,9 +983,8 @@ def detect_zipline_segment(
             video_duration = total_frames / fps if fps > 0 else 0.0
 
             # Initialize MediaPipe Face Detection
-            mp_face_detection = mp.solutions.face_detection
-            face_detection = mp_face_detection.FaceDetection(
-                model_selection=1,  # 0 for short-range, 1 for full-range
+            face_detection = FaceDetectionCompat(
+                model_selection=1,
                 min_detection_confidence=0.5,
             )
 
@@ -1053,6 +1261,26 @@ def detect_zipline_segment(
                             segment_start_time = sample["time"]
                             break
 
+                # At this point, segment_start_time is based purely on motion.
+                # For "coming" videos where the rider starts very far away, this can
+                # still be too early (rider not really visible yet). We have
+                # face_detections collected, so we can refine the start time to be
+                # closer to when a clear face first appears.
+                if segment_start_time is not None and face_detections:
+                    first_face_time = face_detections[0]
+
+                    # Allow the clip to start up to this many seconds *before*
+                    # the first face, so we still see the rider entering while
+                    # avoiding very early frames where they're not in view.
+                    # We use a slightly longer window for "coming" videos so
+                    # we capture more of the ride instead of only the very end.
+                    max_lead_before_face = 3.0  # seconds
+
+                    if segment_start_time < first_face_time - max_lead_before_face:
+                        segment_start_time = max(
+                            0.0, first_face_time - max_lead_before_face
+                        )
+
                 # Determine end time based on ideal_duration
                 if segment_start_time is None:
                     # No rider motion detected - fallback: use segment from (video_duration - ideal_duration) to (video_duration - end_trim_seconds)
@@ -1204,6 +1432,8 @@ def detect_zipline_segment(
                     show_frames,
                     capture_offset_after_start,
                     capture_offset_before_end,
+                    capture_images_output_dir,
+                    filename_prefix,
                 )
 
                 return result
@@ -1226,9 +1456,8 @@ def detect_zipline_segment(
             video_duration = total_frames / fps if fps > 0 else 0.0
 
             # Initialize MediaPipe Face Detection
-            mp_face_detection = mp.solutions.face_detection
-            face_detection = mp_face_detection.FaceDetection(
-                model_selection=1,  # 0 for short-range, 1 for full-range
+            face_detection = FaceDetectionCompat(
+                model_selection=1,
                 min_detection_confidence=0.5,
             )
 
@@ -1491,12 +1720,15 @@ def detect_zipline_segment(
                 capture_images_mode,
                 capture_images_min,
                 capture_images_max,
+                capture_images_min_delay,
                 platform_number,
                 direction,
                 show_progress,
                 show_frames,
                 capture_offset_after_start,
                 capture_offset_before_end,
+                capture_images_output_dir,
+                filename_prefix,
             )
 
             return result
@@ -1515,9 +1747,8 @@ def detect_zipline_segment(
             )
 
             # Initialize MediaPipe Face Detection
-            mp_face_detection = mp.solutions.face_detection
-            face_detection = mp_face_detection.FaceDetection(
-                model_selection=1,  # 0 for short-range, 1 for full-range
+            face_detection = FaceDetectionCompat(
+                model_selection=1,
                 min_detection_confidence=0.5,
             )
 
@@ -1550,10 +1781,12 @@ def detect_zipline_segment(
 
             # Motion detection threshold (for kitting: walking motion)
             frame_area = frame_width * frame_height
-            # Lower threshold to pick up smaller / distant movers so multiple people register
+            # Lower threshold further to reliably pick up smaller / distant movers
+            # so that even people starting far back in the frame contribute motion.
+            # 0.2% of the frame tends to work better across kitting videos.
             min_motion_area = (
-                frame_area * 0.005
-            )  # 0.5% of frame - walking motion threshold
+                frame_area * 0.002
+            )  # 0.2% of frame - walking motion threshold
 
             # Track detections - person presence (face + motion together indicates walking)
             person_detections = []  # List of (time, has_face, has_motion, motion_area) tuples
@@ -1562,6 +1795,16 @@ def detect_zipline_segment(
             frame_count = 0
             results = None
             pose_results = None
+
+            # Per-person tracking state for kitting (ID -> state dict)
+            person_states: Dict[int, Dict[str, Any]] = {}
+
+            # Movement thresholds (tunable)
+            movement_threshold_px = max(
+                5.0, frame_width * 0.01
+            )  # how many pixels = “moved”
+            stationary_required_seconds = 0.7  # how long someone must be still first
+            stationary_required_frames = int(stationary_required_seconds * fps)
 
             # First pass: collect all person detection data
             while True:
@@ -1646,34 +1889,83 @@ def detect_zipline_segment(
                         if motion_count > 0:
                             has_motion = True
 
-                # Detect pose (full body) with YOLOv8 multi-person
+                # Detect & TRACK people with YOLOv8 pose (gives IDs + keypoints)
                 has_person_body = False
                 pose_overlays = []
                 yolo_pose_count = 0
 
-                if frame_count % sample_interval == 0:
-                    try:
-                        yolo_result = yolo_pose_model(frame, verbose=False)
-                        if yolo_result and len(yolo_result) > 0:
-                            r = yolo_result[0]
-                            if r.keypoints is not None:
-                                kps_list = (
-                                    r.keypoints.xy
-                                )  # list of tensors (num_people x 17 x 2)
-                                for kps in kps_list:
-                                    kps_np = kps.cpu().numpy()
-                                    if kps_np.size == 0:
-                                        continue
+                try:
+                    # Use tracking so each person gets a stable ID across frames
+                    yolo_results = yolo_pose_model.track(
+                        frame,
+                        persist=True,
+                        verbose=False,
+                        classes=[0],  # class 0 = person
+                    )
+
+                    if yolo_results and len(yolo_results) > 0:
+                        r = yolo_results[0]
+                        boxes = r.boxes
+                        kps_tensor = r.keypoints.xy if r.keypoints is not None else None
+
+                        for idx, box in enumerate(boxes):
+                            if box.id is None:
+                                continue
+
+                            person_id = int(box.id)
+                            cx, cy, w, h = box.xywh[0].tolist()
+
+                            # Update per-person state
+                            state = person_states.setdefault(
+                                person_id,
+                                {
+                                    "last_pos": (cx, cy),
+                                    "stationary_frames": 0,
+                                    "walking": False,
+                                    "walking_start_time": None,
+                                },
+                            )
+
+                            px, py = state["last_pos"]
+                            dist = float(np.hypot(cx - px, cy - py))
+
+                            if dist < movement_threshold_px:
+                                # Still essentially stationary
+                                state["stationary_frames"] += 1
+                            else:
+                                # Person moved noticeably
+                                if (
+                                    not state["walking"]
+                                    and state["stationary_frames"]
+                                    >= stationary_required_frames
+                                ):
+                                    # This is the FIRST time this person goes from stationary → walking
+                                    state["walking"] = True
+                                    state["walking_start_time"] = frame_time
+                                    print(
+                                        f"[kitting] person_id={person_id} started walking at "
+                                        f"{frame_time:.2f}s (stationary_frames={state['stationary_frames']}, "
+                                        f"dist={dist:.2f})"
+                                    )
+
+                                # Reset stationary counter after movement
+                                state["stationary_frames"] = 0
+
+                            state["last_pos"] = (cx, cy)
+
+                            # Pose overlay for display (optional)
+                            if kps_tensor is not None and idx < len(kps_tensor):
+                                kps_np = kps_tensor[idx].cpu().numpy()
+                                if kps_np.size > 0:
                                     yolo_pose_count += 1
                                     has_person_body = True
                                     pose_overlays.append(
                                         {"kps": kps_np, "normalized": False}
                                     )
-                        print(
-                            f"[kitting] frame {frame_count}: yolo poses={yolo_pose_count}"
-                        )
-                    except Exception as e:
-                        print(f"[kitting] YOLO pose inference failed: {e}")
+
+                    # print(f"[kitting] frame {frame_count}: tracked people={len(person_states)}")
+                except Exception as e:
+                    print(f"[kitting] YOLO pose tracking failed: {e}")
 
                 # Store person detection: allow multiple simultaneous people
                 # Count walking as any valid face plus motion/body; track how many faces/motion blobs we saw
@@ -1849,15 +2141,15 @@ def detect_zipline_segment(
                 cv2.destroyAllWindows()
 
             # Determine start and end times using person detections
-            # Start: First person detected walking (face + motion/body)
+            # Start: First person detected walking / moving (any person indicator)
             # End: Last person detected (last face that disappears)
 
-            # Find periods where people are walking (sustained person detections)
+            # 1) Find periods where people are walking (sustained person detections)
             walking_periods = []  # List of (start_time, end_time) for each person walking
             current_walking_start = None
-            min_walking_duration = (
-                0.5  # Person must be detected walking for at least 0.5 seconds
-            )
+            # Use a shorter window so we also catch people who are already close to camera
+            # when the video starts, or who only appear briefly at the beginning.
+            min_walking_duration = 0.25
             consecutive_walking_frames = 0
             required_consecutive = int(
                 fps * min_walking_duration / sample_interval
@@ -1889,17 +2181,124 @@ def detect_zipline_segment(
             ):
                 walking_periods.append((current_walking_start, video_duration))
 
-            # Start: First person walking (first walking period)
-            if walking_periods:
+            # 2) Start time: detect when someone STARTS WALKING/MOVING
+            #    Prefer per-person tracking (ID-based) when available, then fall back
+            #    to the older global motion logic.
+            segment_start_time = None
+
+            # 2a) Per-person walking starts from YOLO tracking (highest priority)
+            walking_starts: List[float] = [
+                state["walking_start_time"]
+                for state in person_states.values()
+                if state.get("walking_start_time") is not None
+            ]
+
+            if walking_starts:
+                # Earliest person who went from stationary → walking
+                segment_start_time = min(walking_starts)
+                print(
+                    f"[kitting] using per-person walking start: {segment_start_time:.2f}s "
+                    f"(from {len(walking_starts)} people)"
+                )
+
+            # Establish baseline: what's the typical motion in the first few seconds?
+            # This helps us filter out people who are already standing still
+            baseline_window = min(
+                3.0, video_duration * 0.15
+            )  # First 3s or 15% of video
+            baseline_motion_areas = []
+            baseline_has_any_person = False
+
+            for detection in person_detections:
+                if detection["time"] <= baseline_window:
+                    if detection["has_motion"]:
+                        baseline_motion_areas.append(detection["motion_area"])
+                    if detection["has_person_body"] or detection["has_face"]:
+                        baseline_has_any_person = True
+                else:
+                    break
+
+            # Calculate baseline motion threshold (median of early motion)
+            baseline_motion_threshold = 0.0
+            if baseline_motion_areas:
+                baseline_motion_areas.sort()
+                baseline_motion_threshold = baseline_motion_areas[
+                    len(baseline_motion_areas) // 2
+                ]
+
+            # Now find the first time someone STARTS moving (not just standing)
+            # We look for:
+            # 1. Motion that's significantly larger than baseline (new person moving)
+            # 2. Motion that appears after a period of no/low motion
+            # 3. YOLO body detected WITH motion (person moving, not just standing)
+            motion_appearance_window = 1.5  # Look back 1.5s to check if motion is "new"
+
+            for i, detection in enumerate(person_detections):
+                # Skip the baseline window - we're establishing what's "normal"
+                if detection["time"] <= baseline_window:
+                    continue
+
+                is_starting_to_move = False
+
+                # Method 1: YOLO body + motion = person actively moving (not just standing)
+                if detection["has_person_body"] and detection["has_motion"]:
+                    is_starting_to_move = True
+
+                # Method 2: Significant motion that's NEW (larger than baseline)
+                elif detection["has_motion"]:
+                    # Check if this motion is significantly larger than baseline
+                    if (
+                        not baseline_has_any_person
+                        or detection["motion_area"] > baseline_motion_threshold * 2.0
+                    ):
+                        # Also check if this is "new motion" - wasn't there before
+                        window_start_time = detection["time"] - motion_appearance_window
+                        had_similar_motion_before = False
+
+                        for prev_detection in person_detections:
+                            if prev_detection["time"] < window_start_time:
+                                continue
+                            if prev_detection["time"] >= detection["time"]:
+                                break
+                            # Check if there was similar or larger motion before
+                            if (
+                                prev_detection["has_motion"]
+                                and prev_detection["motion_area"]
+                                >= detection["motion_area"] * 0.8
+                            ):
+                                had_similar_motion_before = True
+                                break
+
+                        # If no similar motion before, this is NEW motion (someone starting)
+                        if not had_similar_motion_before:
+                            is_starting_to_move = True
+
+                # Method 3: Motion that grows significantly (someone starting to walk)
+                elif detection["has_motion"] and i > 0:
+                    # Compare with previous detection to see if motion is growing
+                    prev_detection = person_detections[i - 1]
+                    if prev_detection["has_motion"]:
+                        growth_factor = detection["motion_area"] / max(
+                            prev_detection["motion_area"], 1.0
+                        )
+                        if growth_factor >= 1.5:  # Motion grew by 50%+
+                            is_starting_to_move = True
+
+                if is_starting_to_move:
+                    segment_start_time = detection["time"]
+                    break
+
+            # Fallback: if no "starting motion" detected, use first sustained walking period
+            if segment_start_time is None and walking_periods:
                 segment_start_time = walking_periods[0][0]
-            else:
-                # No walking periods found - look for first person with face + motion
+
+            # Final fallback - first face with motion, or first face, or 0.0
+            if segment_start_time is None:
                 for detection in person_detections:
                     if detection["has_face"] and detection["has_motion"]:
                         segment_start_time = detection["time"]
                         break
                 else:
-                    # Fallback: use first face detection
                     if face_records:
                         segment_start_time = face_records[0]["time"]
                     else:
@@ -2026,6 +2425,8 @@ def detect_zipline_segment(
                     show_frames,
                     capture_offset_after_start,
                     capture_offset_before_end,
+                    capture_images_output_dir,
+                    filename_prefix,
                 )
 
                 return result
@@ -2049,9 +2450,8 @@ def detect_zipline_segment(
             video_duration = total_frames / fps if fps > 0 else 0.0
 
             # Initialize MediaPipe Face Detection
-            mp_face_detection = mp.solutions.face_detection
-            face_detection = mp_face_detection.FaceDetection(
-                model_selection=1,  # 0 for short-range, 1 for full-range
+            face_detection = FaceDetectionCompat(
+                model_selection=1,
                 min_detection_confidence=0.5,
             )
 
@@ -2288,6 +2688,8 @@ def detect_zipline_segment(
                     show_frames,
                     capture_offset_after_start,
                     capture_offset_before_end,
+                    capture_images_output_dir,
+                    filename_prefix,
                 )
 
                 return result
@@ -2311,9 +2713,8 @@ def detect_zipline_segment(
             video_duration = total_frames / fps if fps > 0 else 0.0
 
             # Initialize MediaPipe Face Detection
-            mp_face_detection = mp.solutions.face_detection
-            face_detection = mp_face_detection.FaceDetection(
-                model_selection=1,  # 0 for short-range, 1 for full-range
+            face_detection = FaceDetectionCompat(
+                model_selection=1,
                 min_detection_confidence=0.5,
             )
 
@@ -2660,6 +3061,8 @@ def detect_zipline_segment(
                     show_frames,
                     capture_offset_after_start,
                     capture_offset_before_end,
+                    capture_images_output_dir,
+                    filename_prefix,
                 )
 
                 return result
@@ -2688,8 +3091,8 @@ def detect_zipline_segment(
 
 if __name__ == "__main__":
     result = detect_zipline_segment(
-        input_video_path="kitting/vid13.MP4",
-        platform_number=4,
+        input_video_path="GX010895.MP4",
+        platform_number=2,
         show_frames=True,
     )
 
