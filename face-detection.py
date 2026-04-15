@@ -7,10 +7,101 @@ returning the start and end timestamps for that segment.
 
 import cv2
 import mediapipe as mp
+import urllib.request
 from typing import Optional, Dict, Any, List, Sequence
 import os
 from pathlib import Path
 import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# MediaPipe 0.10+ compatibility shim
+# The old mp.solutions.face_detection API was removed in 0.10.
+# ---------------------------------------------------------------------------
+
+class _RelativeBoundingBox:
+    def __init__(self, xmin, ymin, width, height):
+        self.xmin = xmin
+        self.ymin = ymin
+        self.width = width
+        self.height = height
+
+
+class _RelativeKeypoint:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+
+class _LocationData:
+    def __init__(self, relative_bounding_box, relative_keypoints):
+        self.relative_bounding_box = relative_bounding_box
+        self.relative_keypoints = relative_keypoints
+
+
+class _Detection:
+    def __init__(self, location_data, score):
+        self.location_data = location_data
+        self.score = [score]
+
+
+class _DetectionResult:
+    def __init__(self, detections):
+        self.detections = detections
+
+
+class FaceDetectionCompat:
+    """Wraps MediaPipe Tasks FaceDetector (0.10+) to match the old solutions API."""
+
+    _MODEL_URL = (
+        "https://storage.googleapis.com/mediapipe-models/face_detector/"
+        "blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
+    )
+    _MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blaze_face_short_range.tflite")
+
+    def __init__(self, model_selection=0, min_detection_confidence=0.5):
+        self._ensure_model()
+        base_options = mp.tasks.BaseOptions(model_asset_path=self._MODEL_PATH)
+        options = mp.tasks.vision.FaceDetectorOptions(
+            base_options=base_options,
+            min_detection_confidence=min_detection_confidence,
+        )
+        self._detector = mp.tasks.vision.FaceDetector.create_from_options(options)
+
+    def _ensure_model(self):
+        if not os.path.exists(self._MODEL_PATH):
+            import ssl
+            print("Downloading MediaPipe face detection model...", flush=True)
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with urllib.request.urlopen(self._MODEL_URL, context=ctx) as response:
+                with open(self._MODEL_PATH, "wb") as f:
+                    f.write(response.read())
+
+    def process(self, rgb_frame):
+        h, w = rgb_frame.shape[:2]
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        result = self._detector.detect(mp_image)
+        compat_detections = []
+        for det in result.detections:
+            bb = det.bounding_box
+            rel_bbox = _RelativeBoundingBox(
+                xmin=bb.origin_x / w,
+                ymin=bb.origin_y / h,
+                width=bb.width / w,
+                height=bb.height / h,
+            )
+            rel_keypoints = [_RelativeKeypoint(kp.x, kp.y) for kp in det.keypoints]
+            score = det.categories[0].score if det.categories else 0.0
+            compat_detections.append(_Detection(_LocationData(rel_bbox, rel_keypoints), score))
+        return _DetectionResult(compat_detections)
+
+    def close(self):
+        self._detector.close()
+
+
+# ---------------------------------------------------------------------------
 
 # Optional: YOLOv8 pose for multi-person kitting
 try:
@@ -63,6 +154,8 @@ def _add_image_capture_to_result(
                 capture_mode = "coming"
             elif direction == "going":
                 capture_mode = "going"
+            elif direction == "swimming":
+                capture_mode = "swimming"
             elif direction in ["walking", "kitting", "sitting"]:
                 capture_mode = "group"
             else:
@@ -399,6 +492,14 @@ def trim_video(
             cap.release()
             return False
 
+        actual_video_duration = total_frames / fps
+        end_time_used = end_time < actual_video_duration
+        print(
+            f"  [trim_video] actual video duration: {actual_video_duration:.2f}s | "
+            f"trim range: {start_time:.2f}s -> {end_time:.2f}s | "
+            f"end_time used (clips before video end): {end_time_used}"
+        )
+
         # Calculate frame numbers for start and end
         start_frame = int(start_time * fps)
         end_frame = int(end_time * fps)
@@ -466,7 +567,7 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "min_duration": 5.0,
         "max_duration": 10.0,
         "ideal_duration": 8.0,
-        "end_trim_seconds": 1.0,
+        "end_trim_seconds": 2.0,
         "backward_extension_seconds": 2.0,
         "start_offset_seconds": 0.0,
         "capture_images": True,
@@ -526,6 +627,22 @@ PLATFORM_CONFIGS: Dict[int, Dict[str, Any]] = {
         "capture_offset_after_start": None,
         "capture_offset_before_end": None,
     },
+    6: {
+        "direction": "swimming",
+        "min_duration": 6.0,
+        "max_duration": 20.0,
+        "ideal_duration": 12.0,
+        "end_trim_seconds": 0.5,
+        "backward_extension_seconds": 2.0,
+        "start_offset_seconds": 0.0,
+        "capture_images": True,
+        "capture_images_mode": "swimming",
+        "capture_images_min": 3,
+        "capture_images_max": 8,
+        "capture_images_min_delay": 1.5,
+        "capture_offset_after_start": 1.5,
+        "capture_offset_before_end": 1.5,
+    },
 }
 
 
@@ -559,7 +676,7 @@ def detect_zipline_segment(
 
     Args:
         input_video_path: Path to the raw video file
-        direction: Either "coming", "going", "walking", "kitting", or "sitting" (detection mode)
+        direction: Either "coming", "going", "walking", "kitting", "sitting", or "swimming" (detection mode)
             - If None and platform_number is provided, uses platform's direction
             - If None and platform_number is not provided, defaults to "coming"
         min_duration: Minimum motion duration to be considered valid (seconds)
@@ -600,7 +717,7 @@ def detect_zipline_segment(
             - If platform_number is provided and this is None, uses the platform's configured start_offset_seconds
         capture_images: Optional bool to enable image capture within the detected window
             - If None, defers to the platform configuration (default False)
-        capture_images_mode: Optional capture mode override ("going", "coming", "group", "bridge")
+        capture_images_mode: Optional capture mode override ("going", "coming", "group", "swimming", "bridge")
             - If None, uses platform configuration, then falls back to detection direction
         capture_images_min / capture_images_max: Optional overrides for number of images to capture
             - If None, use platform configuration when available
@@ -800,12 +917,12 @@ def detect_zipline_segment(
         trim_output_path = os.path.join(output_videos_dir, output_filename)
 
     # Validate inputs
-    if direction not in ["coming", "going", "walking", "kitting", "sitting"]:
+    if direction not in ["coming", "going", "walking", "kitting", "sitting", "swimming"]:
         return {
             "input_video": input_video_path,
             "direction": direction,
             "valid": False,
-            "reason": f"Invalid direction: {direction}. Must be 'coming', 'going', 'walking', 'kitting', or 'sitting'",
+            "reason": f"Invalid direction: {direction}. Must be 'coming', 'going', 'walking', 'kitting', 'sitting', or 'swimming'",
             "platform_number": platform_number,
         }
 
@@ -853,8 +970,8 @@ def detect_zipline_segment(
                 output_video_path, fourcc, fps, (frame_width, frame_height)
             )
 
-        if direction == "coming":
-            # For "coming": rider comes from higher platform down to lower platform (camera position)
+        if direction in ["coming", "swimming"]:
+            # For "coming"/"swimming": detect entry with motion and refine with face cues when available.
             # Strategy:
             # - Start = first person detection (rider entering frame)
             # - End = last face detection (rider looking at camera)
@@ -866,9 +983,8 @@ def detect_zipline_segment(
             video_duration = total_frames / fps if fps > 0 else 0.0
 
             # Initialize MediaPipe Face Detection
-            mp_face_detection = mp.solutions.face_detection
-            face_detection = mp_face_detection.FaceDetection(
-                model_selection=1,  # 0 for short-range, 1 for full-range
+            face_detection = FaceDetectionCompat(
+                model_selection=1,
                 min_detection_confidence=0.5,
             )
 
@@ -1340,9 +1456,8 @@ def detect_zipline_segment(
             video_duration = total_frames / fps if fps > 0 else 0.0
 
             # Initialize MediaPipe Face Detection
-            mp_face_detection = mp.solutions.face_detection
-            face_detection = mp_face_detection.FaceDetection(
-                model_selection=1,  # 0 for short-range, 1 for full-range
+            face_detection = FaceDetectionCompat(
+                model_selection=1,
                 min_detection_confidence=0.5,
             )
 
@@ -1632,9 +1747,8 @@ def detect_zipline_segment(
             )
 
             # Initialize MediaPipe Face Detection
-            mp_face_detection = mp.solutions.face_detection
-            face_detection = mp_face_detection.FaceDetection(
-                model_selection=1,  # 0 for short-range, 1 for full-range
+            face_detection = FaceDetectionCompat(
+                model_selection=1,
                 min_detection_confidence=0.5,
             )
 
@@ -2336,9 +2450,8 @@ def detect_zipline_segment(
             video_duration = total_frames / fps if fps > 0 else 0.0
 
             # Initialize MediaPipe Face Detection
-            mp_face_detection = mp.solutions.face_detection
-            face_detection = mp_face_detection.FaceDetection(
-                model_selection=1,  # 0 for short-range, 1 for full-range
+            face_detection = FaceDetectionCompat(
+                model_selection=1,
                 min_detection_confidence=0.5,
             )
 
@@ -2600,9 +2713,8 @@ def detect_zipline_segment(
             video_duration = total_frames / fps if fps > 0 else 0.0
 
             # Initialize MediaPipe Face Detection
-            mp_face_detection = mp.solutions.face_detection
-            face_detection = mp_face_detection.FaceDetection(
-                model_selection=1,  # 0 for short-range, 1 for full-range
+            face_detection = FaceDetectionCompat(
+                model_selection=1,
                 min_detection_confidence=0.5,
             )
 

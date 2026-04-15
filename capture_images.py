@@ -10,8 +10,147 @@ import cv2  # type: ignore
 import mediapipe as mp  # type: ignore
 import numpy as np
 import os
+import ssl
+import urllib.request
 from typing import List, Dict, Tuple, Optional, Any
 from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# MediaPipe 0.10+ compatibility shim
+# The old mp.solutions.face_detection and mp.solutions.face_mesh APIs were
+# removed in 0.10. These wrappers expose the same interface using Tasks API.
+# ---------------------------------------------------------------------------
+
+def _download_model(url: str, dest_path: str) -> None:
+    if not os.path.exists(dest_path):
+        print(f"Downloading MediaPipe model to {os.path.basename(dest_path)}...", flush=True)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with urllib.request.urlopen(url, context=ctx) as response:
+            with open(dest_path, "wb") as f:
+                f.write(response.read())
+
+
+_MODELS_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+class _RelativeBoundingBox:
+    def __init__(self, xmin, ymin, width, height):
+        self.xmin = xmin
+        self.ymin = ymin
+        self.width = width
+        self.height = height
+
+
+class _RelativeKeypoint:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+
+class _LocationData:
+    def __init__(self, relative_bounding_box, relative_keypoints):
+        self.relative_bounding_box = relative_bounding_box
+        self.relative_keypoints = relative_keypoints
+
+
+class _FaceDetection:
+    def __init__(self, location_data, score):
+        self.location_data = location_data
+        self.score = [score]
+
+
+class _FaceDetectionResult:
+    def __init__(self, detections):
+        self.detections = detections
+
+
+class FaceDetectionCompat:
+    """Wraps MediaPipe Tasks FaceDetector (0.10+) to match old solutions API."""
+    _MODEL_URL = (
+        "https://storage.googleapis.com/mediapipe-models/face_detector/"
+        "blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
+    )
+    _MODEL_PATH = os.path.join(_MODELS_DIR, "blaze_face_short_range.tflite")
+
+    def __init__(self, model_selection=0, min_detection_confidence=0.5):
+        _download_model(self._MODEL_URL, self._MODEL_PATH)
+        base_options = mp.tasks.BaseOptions(model_asset_path=self._MODEL_PATH)
+        options = mp.tasks.vision.FaceDetectorOptions(
+            base_options=base_options,
+            min_detection_confidence=min_detection_confidence,
+        )
+        self._detector = mp.tasks.vision.FaceDetector.create_from_options(options)
+
+    def process(self, rgb_frame):
+        h, w = rgb_frame.shape[:2]
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        result = self._detector.detect(mp_image)
+        compat_detections = []
+        for det in result.detections:
+            bb = det.bounding_box
+            rel_bbox = _RelativeBoundingBox(
+                xmin=bb.origin_x / w,
+                ymin=bb.origin_y / h,
+                width=bb.width / w,
+                height=bb.height / h,
+            )
+            rel_keypoints = [_RelativeKeypoint(kp.x, kp.y) for kp in det.keypoints]
+            score = det.categories[0].score if det.categories else 0.0
+            compat_detections.append(_FaceDetection(_LocationData(rel_bbox, rel_keypoints), score))
+        return _FaceDetectionResult(compat_detections)
+
+    def close(self):
+        self._detector.close()
+
+
+class _FaceLandmarksCompat:
+    """Wraps a list of NormalizedLandmark to expose a .landmark attribute."""
+    def __init__(self, landmarks_list):
+        self.landmark = landmarks_list  # list of NormalizedLandmark with .x .y .z
+
+
+class _FaceMeshResult:
+    def __init__(self, multi_face_landmarks):
+        self.multi_face_landmarks = multi_face_landmarks  # list or None
+
+
+class FaceMeshCompat:
+    """Wraps MediaPipe Tasks FaceLandmarker (0.10+) to match old solutions FaceMesh API."""
+    _MODEL_URL = (
+        "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+        "face_landmarker/float16/1/face_landmarker.task"
+    )
+    _MODEL_PATH = os.path.join(_MODELS_DIR, "face_landmarker.task")
+
+    def __init__(self, static_image_mode=False, max_num_faces=1, refine_landmarks=True,
+                 min_detection_confidence=0.5, min_tracking_confidence=0.5):
+        _download_model(self._MODEL_URL, self._MODEL_PATH)
+        base_options = mp.tasks.BaseOptions(model_asset_path=self._MODEL_PATH)
+        options = mp.tasks.vision.FaceLandmarkerOptions(
+            base_options=base_options,
+            num_faces=max_num_faces,
+            min_face_detection_confidence=min_detection_confidence,
+            running_mode=mp.tasks.vision.RunningMode.IMAGE,
+        )
+        self._landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(options)
+
+    def process(self, rgb_frame):
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        result = self._landmarker.detect(mp_image)
+        if result.face_landmarks:
+            multi = [_FaceLandmarksCompat(fl) for fl in result.face_landmarks]
+        else:
+            multi = None
+        return _FaceMeshResult(multi)
+
+    def close(self):
+        self._landmarker.close()
+
+
+# ---------------------------------------------------------------------------
 
 DEFAULT_GUIDE_REGION_WIDTH_RATIO = 0.4
 DEFAULT_GUIDE_REGION_HEIGHT_RATIO = 0.8
@@ -557,10 +696,11 @@ def capture_images_from_video(
 
     Args:
         video_path: Path to input video file
-        mode: Detection mode ("going", "coming", "group", or "bridge")
+        mode: Detection mode ("going", "coming", "group", "swimming", or "bridge")
             - "going": Face detection with smile detection and ranking
             - "coming": Person detection filtering out guide in bottom left corner
             - "group": Detects multiple faces and captures frames with most faces visible
+            - "swimming": Water activity mode for solo/group swimmers
             - "bridge": Person walking on skyline towards camera, captures in last 50% of video with face detection
             - If None, defaults to "going"
         min_pictures: Minimum number of pictures to capture (defaults to 5 if None)
@@ -606,10 +746,10 @@ def capture_images_from_video(
         )
 
     # Validate mode
-    if mode not in ["going", "coming", "group", "bridge"]:
+    if mode not in ["going", "coming", "group", "swimming", "bridge"]:
         return {
             "success": False,
-            "error": f"Invalid mode: {mode}. Must be 'going', 'coming', 'group', or 'bridge'",
+            "error": f"Invalid mode: {mode}. Must be 'going', 'coming', 'group', 'swimming', or 'bridge'",
         }
 
     # Validate video file
@@ -803,14 +943,12 @@ def capture_images_from_video(
     guide_region_margin_px = max(10, int(frame_width * 0.02))
 
     # Initialize MediaPipe
-    mp_face_detection = mp.solutions.face_detection
-    mp_face_mesh = mp.solutions.face_mesh
-    face_detection = mp_face_detection.FaceDetection(
-        model_selection=1,  # Full-range model
-        min_detection_confidence=0.3,
+    face_detection = FaceDetectionCompat(
+        model_selection=1,
+        min_detection_confidence=0.5,
     )
 
-    face_mesh = mp_face_mesh.FaceMesh(
+    face_mesh = FaceMeshCompat(
         static_image_mode=False,
         max_num_faces=1,
         refine_landmarks=True,
@@ -822,11 +960,16 @@ def capture_images_from_video(
     # (used in coming/group/bridge modes, and as a low-priority fallback for going)
     # Made more sensitive for coming/bridge modes to better detect persons
     bg_subtractor = None
-    if mode in ["coming", "group", "going", "bridge"]:
+    if mode in ["coming", "group", "swimming", "going", "bridge"]:
         if mode in ["coming", "bridge"]:
             # More sensitive for coming/bridge modes - lower threshold to detect persons better
             bg_subtractor = cv2.createBackgroundSubtractorMOG2(
                 history=300, varThreshold=30, detectShadows=True
+            )
+        elif mode == "swimming":
+            # Water movement is noisy; keep detection moderately sensitive.
+            bg_subtractor = cv2.createBackgroundSubtractorMOG2(
+                history=400, varThreshold=35, detectShadows=True
             )
         else:
             bg_subtractor = cv2.createBackgroundSubtractorMOG2(
@@ -1616,6 +1759,143 @@ def capture_images_from_video(
                                 "rejected": "too_small",
                             }
 
+            elif mode == "swimming":
+                # SWIMMING MODE: supports solo and group swimmers.
+                # Accept frames with at least one swimmer/person signal.
+                person_count = 0
+                person_bboxes = []
+
+                if bg_subtractor is not None:
+                    fg_mask = bg_subtractor.apply(frame)
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
+                    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+
+                    contours, _ = cv2.findContours(
+                        fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                    )
+                    if contours:
+                        min_area = (frame_width * frame_height) * 0.015
+                        for contour in contours:
+                            area = cv2.contourArea(contour)
+                            if area >= min_area:
+                                x, y, w, h = cv2.boundingRect(contour)
+                                person_bboxes.append((x, y, w, h))
+                                person_count += 1
+
+                face_results = face_detection.process(rgb_frame)
+                face_count = 0
+                face_bboxes = []
+                valid_faces = []
+                if face_results.detections:
+                    for det in face_results.detections:
+                        bbox = det.location_data.relative_bounding_box
+                        confidence = det.score[0]
+                        x = int(bbox.xmin * frame_width)
+                        y = int(bbox.ymin * frame_height)
+                        w = int(bbox.width * frame_width)
+                        h = int(bbox.height * frame_height)
+                        x = max(0, x)
+                        y = max(0, y)
+                        w = min(w, frame_width - x)
+                        h = min(h, frame_height - y)
+
+                        min_face_width = int(frame_width * 0.025)
+                        if (
+                            w >= min_face_width
+                            and h >= min_face_width
+                            and confidence >= 0.45
+                        ):
+                            valid_faces.append(
+                                {
+                                    "bbox": (x, y, w, h),
+                                    "confidence": confidence,
+                                }
+                            )
+                            face_bboxes.append((x, y, w, h))
+                            face_count += 1
+
+                total_count_int = max(person_count, face_count)
+                total_count = float(total_count_int)
+
+                if total_count >= 1:
+                    count_score = total_count * 0.45
+                    avg_confidence = 0.0
+                    if len(valid_faces) > 0:
+                        avg_confidence = sum(
+                            f["confidence"] for f in valid_faces
+                        ) / len(valid_faces)
+                    confidence_score = avg_confidence * 0.2
+                    sharpness_score_component = (sharpness_score / 500.0) * 0.2
+                    dual_signal_bonus = (
+                        0.15 if (person_count > 0 and face_count > 0) else 0.0
+                    )
+                    total_score = (
+                        count_score
+                        + confidence_score
+                        + sharpness_score_component
+                        + dual_signal_bonus
+                    )
+
+                    if person_count > 0 and face_count > 0:
+                        priority_level = 3
+                    elif face_count > 0:
+                        priority_level = 2
+                    else:
+                        priority_level = 1
+
+                    primary_bbox = None
+                    if person_bboxes:
+                        primary_bbox = max(
+                            person_bboxes, key=lambda b: float(b[2]) * float(b[3])
+                        )
+                    elif face_bboxes:
+                        primary_bbox = max(
+                            face_bboxes, key=lambda b: float(b[2]) * float(b[3])
+                        )
+
+                    candidate_frames.append(
+                        {
+                            "frame": frame.copy(),
+                            "frame_count": frame_count,
+                            "time": frame_time,
+                            "score": total_score,
+                            "priority_level": priority_level,
+                            "person_count": person_count,
+                            "face_count": face_count,
+                            "total_count": total_count,
+                            "avg_confidence": avg_confidence,
+                            "sharpness": sharpness_score,
+                            "person_bboxes": person_bboxes,
+                            "face_bboxes": face_bboxes,
+                            "bbox": primary_bbox,
+                        }
+                    )
+
+                    last_detection_info = {
+                        "person_count": person_count,
+                        "face_count": face_count,
+                        "total_count": total_count,
+                        "person_bboxes": person_bboxes,
+                        "face_bboxes": face_bboxes,
+                        "avg_confidence": avg_confidence,
+                        "sharpness": sharpness_score,
+                        "score": total_score,
+                        "priority_level": priority_level,
+                        "bbox": primary_bbox,
+                    }
+                else:
+                    last_detection_info = {
+                        "person_count": person_count,
+                        "face_count": face_count,
+                        "total_count": 0.0,
+                        "person_bboxes": person_bboxes,
+                        "face_bboxes": face_bboxes,
+                        "avg_confidence": 0.0,
+                        "sharpness": sharpness_score,
+                        "score": 0.0,
+                    }
+
             elif mode == "group":
                 # GROUP MODE: Detect both people (person detection) and faces
                 # Count total people/faces to capture frames with most people visible
@@ -2208,7 +2488,7 @@ def capture_images_from_video(
                         2,
                     )
 
-            elif mode == "group":
+            elif mode in ["group", "swimming"]:
                 # Draw all detected people and faces
                 # Detect faces on THIS frame for visualization
                 face_results_viz = face_detection.process(rgb_frame)
@@ -2273,13 +2553,14 @@ def capture_images_from_video(
                     if face_results_viz and face_results_viz.detections
                     else face_count
                 )
+                min_required_subjects = 2 if mode == "group" else 1
                 info_text = [
                     f"Time: {frame_time:.2f}s | Frame: {frame_count}",
                     f"Mode: {mode} | Candidates: {len(candidate_frames)}",
                     f"People: {person_count} | Valid Faces: {face_count} | All Faces: {total_detected_faces} | Total: {total_count:.1f}",
                     f"Avg Confidence: {avg_confidence:.2f} | Sharpness: {sharpness:.1f}",
                     f"Score: {score:.3f} | Status: ACCEPTED"
-                    if total_count >= 2
+                    if total_count >= min_required_subjects
                     else f"Score: {score:.3f} | Status: NEEDS MORE",
                 ]
                 for i, text in enumerate(info_text):
@@ -2293,10 +2574,14 @@ def capture_images_from_video(
                         2,
                     )
                 else:
-                    # No detection or less than 2 people/faces
+                    # No detection or less than required people/faces
                     cv2.putText(
                         display_frame,
-                        f"Time: {frame_time:.2f}s | Searching for groups (min 2 people/faces)...",
+                        (
+                            f"Time: {frame_time:.2f}s | Searching for groups (min 2 people/faces)..."
+                            if mode == "group"
+                            else f"Time: {frame_time:.2f}s | Searching for swimmers..."
+                        ),
                         (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.7,
